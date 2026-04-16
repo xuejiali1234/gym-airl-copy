@@ -1,0 +1,78 @@
+# 1. 忽略 Python 虚拟环境和缓存
+# Clean repository rules added for code-only Git upload.
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+.idea/
+.vscode/
+.codex/
+train_log/
+logs/
+results/
+runs/
+baseline_attn_*/
+!train_log/
+train_log/*
+!train_log/*.py
+checkpoints/
+models/
+weights/
+*.pt
+*.pth
+*.pkl
+*.pickle
+*.joblib
+*.zip
+*.tar
+*.tar.gz
+data/
+*.csv
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.parquet
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+*.avi
+.DS_Store
+Thumbs.db
+
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# 2. 忽略训练日志和评估数据 (根据你的截图和描述)
+train_log/
+logs/
+results/
+baseline_attn_*/
+*.csv
+*.png  # 如果你不想把生成的折线图也传上去
+
+# 3. 忽略模型权重文件
+checkpoints/
+models/
+weights/
+*.pt
+*.pth
+*.zip
+*.tar.gz
+*.png
+data/
+
+# Repository overrides: keep only plotting source scripts under train_log.
+!train_log/
+train_log/*
+!train_log/*.py
+
+# IDE / local tooling
+.idea/

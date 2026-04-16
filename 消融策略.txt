@@ -1,0 +1,103 @@
+你这个现象并不奇怪，而且从你现在仓库的实现看，问题不在于你“不会做消融”，而在于当前这个开关不是一个**干净的单模块消融**。`ENABLE_SAFETY_MODULE=False` 不只是关掉一个安全 loss，它会同时不再预训练安全网、把 reward/discriminator 从 `SafeQAttentionRewardNet` / `SafeQMLPRewardNet` 切回 `AttentionRewardNet` / `BasicRewardNet`，还把 trainer 从 `MildSafetyAIRL(..., safety_loss_weight=...)` 切回 vanilla `AIRL`。这已经是“换了 reward net 家族 + 换了判别器目标 + 去掉安全先验”的组合变化了。([GitHub][1])
+
+更关键的是，在 `imitation` 这条 AIRL 管线里，generator 训练吃的是**learned reward**，不是你环境里原始的 `env.step()` reward。官方文档明确说 reward wrapper 会替换环境 reward，`AdversarialTrainer` 的 `venv_train` 也是默认用 train reward；而你自己的环境 reward 本身很稀疏，核心就是并道成功 `+0.5`、终点成功 `+0.5`、安全成功 `+1.0`，另外 `GoalRewardWrapper` 只是在 policy training reward 上再加一次跨线 bonus。也就是说，安全模块一关，生成器面对的不是“同一个 reward 少一项”，而是另一套 learned reward 分布，训练崩掉是完全可能的。([模仿][2])
+
+我还看到一个会污染实验结论的地方：`config.py` 里写的是 `SAFETY_FUSE_FEATURE = True`，但训练脚本在 attention 和 MLP 两条分支里都硬编码成了 `fuse_safety_feature=False`，而且日志元数据也把当前实际模式记成了 `safety_embed_dim_effective=1`、`scalar_only`。这说明你现在“安全模块”的真实生效形态，其实只是一个冻结的安全标量先验，不是配置名暗示的完整 feature 融合。配置和实际实现不一致，做 ablation 时很容易误判。([GitHub][3])
+
+所以你那句“消融实验不就是保持原参数吗”只对了一半。对抗式 RL 里可以有两种结果都成立：一种是**严格固定全模型参数**，如果一关模块就崩，这本身说明该模块在提供稳定性；另一种是**预算匹配的小范围重调**，回答“没有这个模块，这个系统最好能做到什么”。你仓库里的复现文档也已经明确写了 AIRL 对随机扰动非常敏感，建议先固定一个 seed 调顺，再用多 seed 复验。([GitHub][4])
+
+你现在最该做的，不是直接把 `ENABLE_SAFETY_MODULE` 当成唯一 ablation 开关，而是把安全模块拆成两个正交开关：
+
+1. **安全输入分支 ablation**：保留 `SafeQ...RewardNet` 和 `MildSafetyAIRL`，但把安全网替换成恒为 0 的 dummy safety net。这样判别器结构、trainer、head 维度都不变，只是安全信号被置零。
+2. **安全辅助损失 ablation**：保留安全输入分支，但把 `safety_loss_weight=0.0`。这样你能单独回答“提升到底来自 safety prior，还是来自 aux loss”。
+3. **vanilla AIRL baseline**：保留你现在 `ENABLE_SAFETY_MODULE=False` 的版本，但把它当成“完整去安全版 baseline”，不要把它当成单因子消融。([GitHub][1])
+
+最小改法可以直接这么做：
+
+```python
+# config.py
+ENABLE_SAFETY_BRANCH = True
+ENABLE_SAFETY_AUX_LOSS = True
+USE_REWARD_NORM = True
+```
+
+```python
+# train_airl_baseline.py
+class ZeroSafetyNet(nn.Module):
+    def __init__(self, feature_dim=128, use_action=True):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.use_action = use_action
+
+    def forward(self, state, action=None, return_feature=False):
+        b = state.shape[0]
+        dev = state.device
+        logit = torch.zeros((b, 1), device=dev)
+        feat = torch.zeros((b, self.feature_dim), device=dev)
+        return (logit, feat) if return_feature else logit
+
+    def freeze_all(self):
+        pass
+
+    def enable_light_finetune(self, grad_scale=1.0):
+        pass
+```
+
+```python
+enable_safety_branch = cfg.ENABLE_SAFETY_BRANCH
+enable_safety_aux = cfg.ENABLE_SAFETY_AUX_LOSS
+fuse_safety_feature = getattr(cfg, "SAFETY_FUSE_FEATURE", False)
+
+if enable_safety_branch:
+    safety_net = SafetyQNetwork(
+        state_dim=16,
+        action_dim=2,
+        hidden_dim=128,
+        use_action=cfg.SAFETY_USE_ACTION,
+    )
+    pretrain_safety_q_network(...)
+else:
+    safety_net = ZeroSafetyNet(feature_dim=128, use_action=cfg.SAFETY_USE_ACTION)
+
+if enable_attention:
+    base_reward_net = SafeQAttentionRewardNet(
+        observation_space=env.observation_space,
+        action_space=env.action_space,
+        safety_net=safety_net,
+        hidden_dim=64,
+        safety_embed_dim=32 if fuse_safety_feature else 1,
+        freeze_safety=True,
+        fuse_safety_feature=fuse_safety_feature,
+    )
+else:
+    base_reward_net = SafeQMLPRewardNet(
+        observation_space=env.observation_space,
+        action_space=env.action_space,
+        safety_net=safety_net,
+        safety_embed_dim=32 if fuse_safety_feature else 1,
+        freeze_safety=True,
+        fuse_safety_feature=fuse_safety_feature,
+    )
+
+reward_net = GoalRewardWrapper(base_reward_net, ...)
+reward_net = NormalizedRewardNet(reward_net, normalize_output_layer=RunningNorm)
+
+airl_trainer = MildSafetyAIRL(
+    ...,
+    reward_net=reward_net,
+    safety_loss_weight=cfg.SAFETY_REGULATOR_COEFF if enable_safety_aux else 0.0,
+)
+```
+
+这里还有两个很实用的稳定化动作。第一，给 reward 加 `NormalizedRewardNet(RunningNorm)`；官方文档明确说 reward normalization 对稳定 policy training 很有帮助。第二，先跑一轮 `debug_use_ground_truth=True`，因为 `AdversarialTrainer` 就支持这个开关：如果 ground-truth reward 下 PPO 很稳，而 learned reward 下 no-safety 版本崩，那问题就不在环境/PPO，而在 discriminator / reward scale。([模仿][2])
+
+如果你还想保留“纯无安全模块”的 vanilla AIRL baseline，那我建议不要死守全开参数。基于你当前配置里的 `DISCRIMINATOR_LEARNING_RATE=5e-5`、`GENERATOR_LEARNING_RATE=8e-5`、`N_DISC_UPDATES_PER_ROUND=6`、`ENT_COEF=0.005`、`TARGET_KL=0.01`，我会按这个顺序小调：先把 discriminator 降到 `2e-5 ~ 3e-5`，再把 `n_disc_updates_per_round` 从 `6` 降到 `3/4`；如果 PPO 还抖，再把 generator lr 降到 `5e-5`，把 `ent_coef` 提到 `0.01`，必要时把 `target_kl` 收紧到 `0.005`。这些旋钮正好对应 SB3 PPO 文档里最直接影响更新幅度和探索强度的参数。([GitHub][3])
+
+最后，实验报告最好这样写：一组是“**fixed-hyperparam ablation**”，展示关安全后曲线会崩，证明安全模块带来稳定性；另一组是“**retuned no-safety baseline**”，展示在同等搜索预算下，无安全版本的最好成绩。再按你文档里建议的 42/52/62 做多 seed。这样你的结论就会非常扎实：既说明模块让训练更稳，也说明模块在重调后的最终性能上到底带来了多少净收益。([GitHub][4])
+
+你先别把“关安全模块后崩了”当成消融失败；按你当前代码，这反而说明安全模块在做的不只是加分，而是在**稳住 AIRL 的训练动力学**。先把消融拆干净，再比较性能，结论会可信很多。
+
+[1]: https://github.com/xuejiali1234/gym-airl/blob/main/train_airl_baseline.py "gym-airl/train_airl_baseline.py at main · xuejiali1234/gym-airl · GitHub"
+[2]: https://imitation.readthedocs.io/en/latest/main-concepts/reward_networks.html "Reward Networks - imitation"
+[3]: https://raw.githubusercontent.com/xuejiali1234/gym-airl/main/configs/config.py "raw.githubusercontent.com"
+[4]: https://github.com/xuejiali1234/gym-airl/blob/main/reproducibility_guide.md "gym-airl/reproducibility_guide.md at main · xuejiali1234/gym-airl · GitHub"
