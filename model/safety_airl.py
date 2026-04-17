@@ -50,6 +50,9 @@ class MildSafetyAIRL(AIRL):
             last_total = None
             last_aux = None
             last_reg = None
+            last_reward_expert = None
+            last_reward_gen = None
+            last_reward_gap = None
 
             for batch in batch_iter:
                 disc_logits = self.logits_expert_is_high(
@@ -89,6 +92,20 @@ class MildSafetyAIRL(AIRL):
                 last_reg = reg_loss.detach()
                 last_total = loss.detach()
 
+                with th.no_grad():
+                    raw_reward = self._reward_net(
+                        batch["state"],
+                        batch["action"],
+                        batch["next_state"],
+                        batch["done"],
+                    )
+                    labels = batch["labels_expert_is_one"].bool()
+                    gen_labels = ~labels
+                    if labels.any() and gen_labels.any():
+                        last_reward_expert = raw_reward[labels].mean().detach()
+                        last_reward_gen = raw_reward[gen_labels].mean().detach()
+                        last_reward_gap = (last_reward_expert - last_reward_gen).detach()
+
             self._disc_opt.step()
             self._disc_step += 1
 
@@ -99,6 +116,10 @@ class MildSafetyAIRL(AIRL):
                 train_stats["disc_safety_reg_loss"] = float(last_reg.item())
                 train_stats["disc_total_loss"] = float(last_total.item())
                 train_stats["disc_safety_weight"] = float(self.safety_loss_weight)
+                if last_reward_gap is not None:
+                    train_stats["disc_reward_expert_mean"] = float(last_reward_expert.item())
+                    train_stats["disc_reward_gen_mean"] = float(last_reward_gen.item())
+                    train_stats["disc_reward_gap"] = float(last_reward_gap.item())
 
             self.logger.record("global_step", self._global_step)
             for k, v in train_stats.items():

@@ -79,7 +79,7 @@ class Figure5Generator:
             sys.exit(1)
 
         # 2. 加载 SB3 PPO 模型
-        model_path = os.path.join(root_dir, "checkpoints", "baseline_policy_attn_goal_zero_branch_noaux_epoch_300.zip")
+        model_path = os.path.join(root_dir, "checkpoints", "baseline_policy_attn_goal_safe_branch_aux_epoch_300.zip")
         if not os.path.exists(model_path):
             print(f"⚠️ 未找到模型: {model_path}，请检查路径。")
             sys.exit(1)

@@ -1,0 +1,235 @@
+你现在这个现象，本质上不是“模型一开始更好，后来变差了”，而是**你画的这条曲线的零点本来就没有物理意义**，再加上你当前实现里，**PPO 看到的 reward、环境 reward、判别器 forward reward 不是同一个量**。这三个口径没分清，就会觉得“为什么越训越负”。([GitHub][1])
+
+先把你这条链路严格拆开。
+
+你的环境原始 reward 是稀疏正奖励：首次成功并入目标车道加 `0.5`，endpoint success 再加 `0.5`，safety success 再加 `1.0`。但训练入口里，AIRL 用 `RewardVecEnvWrapper(reward_fn=self.reward_train.predict_processed)` 把环境 reward 替换成 learned reward；而你自己的 `GoalRewardWrapper` 又只在 `predict_processed()` 里额外加了一次 `goal_bonus=0.5`。你这次 run 的有效参数也确实是 `goal_bonus=0.5`、`n_disc_updates_per_round=6`、`safety_phase_initial="frozen"`。所以，**PPO 真正训练时看到的主要是“判别器 learned reward + 一次性的 0.5 bonus”**，不是环境那套 `0.5 + 0.5 + 1.0`。([GitHub][2]) 
+
+更关键的是，AIRL 判别器的 logit 用的是
+[
+\text{logit}(D)=r_\theta(s,a,\dots)-\log \pi(a|s),
+]
+而 `PredictProcessedWrapper.forward()` 默认直接走 `base.forward()`；也就是说，你这个 `GoalRewardWrapper` 里那次 `+0.5` 只影响 `predict_processed()`，也就是 PPO 训练和 `ep_rew_wrapped_mean`，**并不直接锚定判别器 forward reward 的零点**。所以你看到的“wrapped reward 越来越负”，并不等价于“判别器学坏了”或“任务性能下降了”。([GitHub][3])
+
+为什么会出现“初始更高，后面更低”？
+
+第一层原因是初始化。你这里 reward net 是普通 MLP/attention MLP，输入又是归一化状态；刚初始化时，输出通常就在 0 附近。这时 episode return 接近 0，不代表好，只代表**网络还没学出明确偏好**。这是“假高”，不是“真高”。
+
+第二层原因是你的正奖励太稀疏。你当前 PPO-visible reward 里，人工加进去的正项只有**一次性的 `0.5` merge bonus**。如果一条 episode 大约 75 步，那么要让整条 episode return 仍然为正，只需要 dense learned reward 的步均值不低于
+[
+-0.5 / 75 \approx -0.0067.
+]
+这个阈值极其接近 0。你上传的当前 `progress.csv` 末尾，`ep_rew_wrapped_mean` 已经大约是 `-182.8`，而 `ep_len_mean` 约 `74.8`，折算下来步均值大约 `-2.44`。所以后期 episode sum 变成负数，在数学上几乎是必然的，不是偶然。
+
+第三层原因是 AIRL 学到的是**区分 expert / generator 的相对打分**，不是“把 generator rollout 的平均 reward 单调抬高”。一旦判别器开始把大量 generator 常访问、但不够 expert-like 的状态动作打成负分，generator rollout 的均值就会下去；而你这个指标统计的恰恰是**generator 自己访问到的轨迹的均值**，不是 expert-gen 间的 gap。你同批标准 AIRL 日志里，这个现象也反复出现：很早期 `ep_rew_wrapped_mean` 就在 `-0.953` 左右，之后到几千步会掉到 `-66.6`，再到一万多步到 `-132` 左右，说明这更像是当前 reward 口径的系统性表现，不是某一次 seed 单独坏掉。  
+
+第四层原因是理论上，AIRL/IRL 的 reward 绝对值本来就**只在加法常数意义下可识别**。后续关于 AIRL 的总结明确写到：state-only 情况下，恢复的 reward 只到“差一个常数”为止；原始 AIRL 论文自己在图里也会“减去一个常数 offset 以便可视化”，并明确说明这不影响最优策略。换句话说，**0 点是你自己选的，不是任务给的**。所以“为什么一开始是 0，后来变成负数”，严格答案就是：因为你目前没有给 learned reward 固定零点，而训练过程中这个零点会漂。([arXiv][4])
+
+你之前问“为什么 value/policy 初期不是在高处然后往下降”，也是同一个逻辑。
+在 AIRL 里，critic 追的是一个**会变化的 reward 目标**。初期 reward net 近 0，所以 return target 也近 0，`value_loss` 小很正常；后面 reward 量级变大、而且还在动，critic 追一个 moving target，`value_loss` 变大也正常。它不像固定 reward 的普通 PPO，不应该期待“一开始高、后面单调下降”。
+
+---
+
+### 现在只考虑把“判别器奖励/论文里这条 reward 曲线”调成正数，怎么做
+
+我把方案按风险从低到高排：
+
+#### 方案 A：只改展示，不改训练
+
+这是我最推荐的。
+
+因为 AIRL reward 只差一个常数就等价，所以你完全可以对**画图用的 reward**做“固定零点”。最严谨的做法不是直接给 episode return 加常数，而是对**每步 reward**加常数 (c)，然后把 episode 曲线画成：
+[
+R'*{\text{ep}} = R*{\text{ep}} + c \cdot L_{\text{ep}},
+]
+其中 (L_{\text{ep}}) 是 episode length。这样才与 “(r'(s,a)=r(s,a)+c)” 完全一致。原始 AIRL 论文自己也做过这种常数平移可视化。
+
+按你当前日志，最近 50 个点的步均值大约在 `-2.54` 左右。
+所以你可以直接取：
+
+```python
+# plot_only_shift.py
+import numpy as np
+import pandas as pd
+
+df = pd.read_csv("progress.csv")
+
+R = pd.to_numeric(df["mean/gen/rollout/ep_rew_wrapped_mean"], errors="coerce")
+L = pd.to_numeric(df["mean/gen/rollout/ep_len_mean"], errors="coerce")
+
+per_step = (R / L).dropna()
+c = float(-per_step.iloc[-50:].median() + 0.05)   # 你这次日志大约会得到 2.59，建议取 2.6
+
+df["wrapped_rew_per_step_shifted"] = R / L + c
+df["wrapped_rew_ep_shifted"] = R + c * L
+
+df.to_csv("progress_shifted.csv", index=False)
+print(f"per-step shift c = {c:.3f}")
+```
+
+你这条 run，`c=2.6` 基本就够把后期 episode mean 拉到正区间了，而且**完全不动训练性能**。
+论文里写法可以是：
+
+> “For visualization only, we report an affine-shifted AIRL reward (r'(s,a)=r(s,a)+c), since AIRL rewards are identifiable only up to an additive constant.”
+
+这套写法最稳。
+
+#### 方案 B：让训练日志里的 `ep_rew_wrapped_mean` 也变正，但尽量不动判别器
+
+这是“最小代码改动”的训练侧方案。
+
+思路是：**不要改 `forward()`，只改 `predict_processed()`**。
+因为在你的实现里，PPO 和 `ep_rew_wrapped_mean` 走的是 `predict_processed()`；判别器 logit 走的是 `forward()`。所以你可以再包一层 `PredictProcessedWrapper`，只给 PPO-visible reward 加一个固定正偏置。这样判别器本身不变，但训练日志会变正。([GitHub][5])
+
+新建一个 wrapper：
+
+```python
+# model/positive_shift_wrapper.py
+import numpy as np
+from imitation.rewards.reward_nets import PredictProcessedWrapper
+
+class PositiveShiftWrapper(PredictProcessedWrapper):
+    """Only shifts PPO-visible reward / ep_rew_wrapped_mean.
+    Discriminator forward/logits stay unchanged.
+    """
+    def __init__(self, base, shift: float = 0.0):
+        super().__init__(base)
+        self.shift = float(shift)
+
+    def predict_processed(self, state, action, next_state, done, **kwargs):
+        rew = self.base.predict_processed(state, action, next_state, done, **kwargs)
+        rew = np.asarray(rew, dtype=np.float32) + self.shift
+        if rew.ndim == 0:
+            return rew.reshape(())
+        return rew
+```
+
+然后在 `train_airl_baseline.py` 里这样接：
+
+```python
+from model.positive_shift_wrapper import PositiveShiftWrapper
+
+positive_reward_shift = getattr(cfg, "POSITIVE_REWARD_SHIFT", 0.0)
+
+reward_net = GoalRewardWrapper(
+    base_reward_net,
+    expert_mean_x=train_dataset.expert_mean[0],
+    expert_std_x=train_dataset.expert_std[0],
+    divider_x=divider_x,
+    goal_bonus=goal_bonus,
+)
+
+if enable_reward_norm:
+    reward_net = NormalizedRewardNet(reward_net, normalize_output_layer=RunningNorm)
+
+# 一定放在最外层，这样即便以后开 reward normalization，
+# 最终写进 PPO / ep_rew_wrapped_mean 的仍是正数
+if positive_reward_shift > 0:
+    reward_net = PositiveShiftWrapper(reward_net, shift=positive_reward_shift)
+```
+
+配置里加一项：
+
+```python
+POSITIVE_REWARD_SHIFT = 2.6
+```
+
+对你这次日志，`2.6` 是比较合适的起点：
+它比当前后期步均值的绝对值略大一点，足够把曲线抬到正区间，但又比 `2.8/3.0` 更保守。
+
+但这里必须给你一个严谨的提醒：
+你当前 trainer 是 `allow_variable_horizon=True`。在**变长 episode**里，给每一步都加常数，会改变 PPO 的真实优化目标，策略可能偏向更长 episode。也就是说，这个方案虽然**不改判别器**，但仍然可能轻微影响性能。([GitHub][6])
+
+所以我的建议是：
+先做 A；只有在你必须让训练日志也为正的时候，再做 B。
+
+#### 方案 C：把“判别器 forward reward 本身”改成正数
+
+这个不是我推荐的，因为它会真改 AIRL 判别器。
+
+如果你真的想让 `self._reward_net(state, action, next_state, done)` 这个 raw reward 也整体上移，就必须改 `forward()`，而不是 `predict_processed()`。技术上可以这样做：
+
+```python
+from imitation.rewards.reward_nets import ForwardWrapper
+
+class ForwardPositiveBias(ForwardWrapper):
+    def __init__(self, base, bias: float = 0.0):
+        super().__init__(base)
+        self.bias = float(bias)
+
+    def forward(self, state, action, next_state, done):
+        return self.base.forward(state, action, next_state, done) + self.bias
+```
+
+使用顺序要放在 `GoalRewardWrapper` **之前**：
+
+```python
+base_reward_net = ForwardPositiveBias(base_reward_net, bias=2.6)
+reward_net = GoalRewardWrapper(
+    base_reward_net,
+    expert_mean_x=train_dataset.expert_mean[0],
+    expert_std_x=train_dataset.expert_std[0],
+    divider_x=divider_x,
+    goal_bonus=goal_bonus,
+)
+```
+
+但这会直接改
+[
+\text{logit}(D)=r_\theta-\log \pi,
+]
+也就是直接改判别器分类边界。它和你“尽量不伤当前性能”的目标冲突，我不建议拿它作为主线。([GitHub][3])
+
+---
+
+### 真正适合回审稿人的做法
+
+不要只给 reviewer 一条 `gen/rollout/ep_rew_wrapped_mean`。
+
+更有说服力的是同时给三条：
+
+1. `eval_ep_rew_mean` / `endpoint_success_rate` / `safety_success_rate`
+2. `disc_reward_gap = E[r(expert)] - E[r(gen)]`
+3. shifted positive wrapped reward（只用于可视化）
+
+其中第 2 条最关键，因为它才直接对应 AIRL 判别器“把 expert 和 generator 拉开”的训练目标。你现在画的是 generator 自己的均值，天然可能越来越负；但 `reward_gap` 更可能是“先增大再收敛”。
+
+你现在开的是安全版 `MildSafetyAIRL`，所以最方便是在 `train_disc()` 里顺手记录 raw reward gap。加这段就行：
+
+```python
+with th.no_grad():
+    raw_reward = self._reward_net(
+        batch["state"],
+        batch["action"],
+        batch["next_state"],
+        batch["done"],
+    )
+    labels = batch["labels_expert_is_one"].bool()
+    r_exp = raw_reward[labels].mean()
+    r_gen = raw_reward[~labels].mean()
+
+train_stats["disc_reward_expert_mean"] = float(r_exp.item())
+train_stats["disc_reward_gen_mean"] = float(r_gen.item())
+train_stats["disc_reward_gap"] = float((r_exp - r_gen).item())
+```
+
+论文里你就可以严谨地解释：
+
+> 我们原图绘制的是 PPO-visible wrapped reward 的 episode mean。该量不是环境任务 reward，也不是判别器原始 reward；其绝对零点在 AIRL 中并不唯一。随着判别器学习到将大量 generator-visited 非专家状态赋予负分，这个 generator-side mean 会下降到负区间，而这并不意味着任务性能下降。为避免歧义，我们补充报告环境成功率/环境回报，以及 expert-generator reward gap；同时，对 AIRL reward 采用仅用于可视化的常数平移以固定零点。
+
+这套说法在理论和实现上都是站得住的。([arXiv][4])
+
+我给你的最终执行顺序是：
+
+1. 先按方案 A 重新出图，`c=2.6`。
+2. 同时在 `train_disc()` 里补 `disc_reward_gap` 日志。
+3. 论文主图用 `success/eval reward + reward gap`，把 shifted wrapped reward 放附图或补充材料。
+4. 只有在你坚持要让训练日志本身为正时，再开方案 B，其他参数全部不动。
+
+你要是按这个思路改，既能把 reviewer 的疑问解释清楚，也不用为了“把负数变正”去冒太大性能风险。
+
+[1]: https://raw.githubusercontent.com/HumanCompatibleAI/imitation/master/src/imitation/algorithms/adversarial/common.py "raw.githubusercontent.com"
+[2]: https://raw.githubusercontent.com/xuejiali1234/gym-airl-copy/main/envs/merging_env.py "raw.githubusercontent.com"
+[3]: https://raw.githubusercontent.com/HumanCompatibleAI/imitation/master/src/imitation/algorithms/adversarial/airl.py "raw.githubusercontent.com"
+[4]: https://arxiv.org/html/2403.14593v1 "Rethinking Adversarial Inverse Reinforcement Learning: From the Angles of Policy Imitation and Transferable Reward Recovery"
+[5]: https://raw.githubusercontent.com/HumanCompatibleAI/imitation/master/src/imitation/rewards/reward_nets.py "raw.githubusercontent.com"
+[6]: https://raw.githubusercontent.com/xuejiali1234/gym-airl-copy/main/train_airl_baseline.py "raw.githubusercontent.com"

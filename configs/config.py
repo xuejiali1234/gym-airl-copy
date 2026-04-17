@@ -89,16 +89,16 @@ class Config:
     # True = 启用安全网络及安全惩罚; False = 关闭 (标准 GC-AIRL)
     ENABLE_SAFETY_MODULE = True
     # True = 使用真实预训练安全先验; False = 使用恒零安全先验以做结构保持消融
-    ENABLE_SAFETY_BRANCH = False
+    ENABLE_SAFETY_BRANCH = True
     # True = 启用判别器辅助安全损失; False = 仅保留安全先验融合分支
-    ENABLE_SAFETY_AUX_LOSS = False
+    ENABLE_SAFETY_AUX_LOSS = True
 
     # [新增] 注意力机制消融实验开关
     # True = 开启多头注意力机制; False = 关闭 (返回全 0 特征)
     ENABLE_ATTENTION = True
     # Stabilization/debug switches. Defaults are off to keep the tuned full model unchanged.
     # 判别器奖励归一化
-    ENABLE_REWARD_NORMALIZATION = True
+    ENABLE_REWARD_NORMALIZATION = False
     # 完全使用环境奖励
     DEBUG_USE_GROUND_TRUTH_REWARD = False
 

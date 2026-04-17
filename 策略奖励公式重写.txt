@@ -1,0 +1,424 @@
+我看完你当前仓库后，最合适的改法不是去碰 AIRL 训练奖励，而是把环境里的奖励**拆成两套口径**：
+
+一套继续给训练链路用，保持你现在已经调好的 `goal_bonus=0.5` 和 AIRL 路径不动；另一套新增 **eval-only dense reward**，只在评估时累计，用来画你想要的 policy return 曲线。你现在的 `MergingEnv.step()` 返回的环境奖励本身就是非常稀疏的：首次进入目标车道加 `0.5`，endpoint success 再加 `0.5`，safety success 再加 `1.0`；而 `evaluate_policy_metrics()` 目前又是直接把 `env.step()` 返回的这个 reward 累加成 `eval_ep_rew_mean`。所以你现在看到的 policy return 天然就是“范围小、台阶感强、很难连续爬升”的。([GitHub][1])
+
+更关键的是，训练侧并不是在用这个环境 reward 学习。你仓库里的 `GoalRewardWrapper` 只改了 `predict_processed()`，也就是 PPO / policy 训练看到的 reward；`imitation` 文档也明确写了，训练 policy 时是把环境包成 `RewardVecEnvWrapper`，用 reward network 的 `predict_processed` 去替换 step reward，而 `PredictProcessedWrapper` 正是给这种“训练/评估 policy 时修改 reward，但不改判别器 forward”用的。你当前 run 的 effective params 里也确实还是 `goal_bonus=0.5`、`n_eval_episodes=20`、`save_freq_epochs=20`。所以只要你把新奖励放进 `info`，而不是改 `step()` 的返回值，就不会影响现在的 AIRL 主线。([GitHub][2]) 
+
+你上传的论文其实已经给了很好的方向。论文在评估里用的是三类指标：效率、安全、舒适；并且明确说因为横向量的波动小、区分度弱，所以主要用纵向 (y) 方向的速度、TTC、headway、jerk 做评价。论文里的 trajectory ranking score 是
+[
+(\bar v_y-\sigma_{v_y})+\overline{TTC}-5\overline{|jerk_y|},
+]
+而 RL baseline 的 reward 结构也是 `efficiency + safety + comfort + goal`。你的仓库 `MergingDataset._calculate_score()` 已经把这个 ranking formula 实现进去了，只是它现在用于 trajectory score / confidence，不是 env step reward。  ([GitHub][3])
+
+所以我建议你这样改。
+
+## 1. 设计原则
+
+不要直接把论文里的 ranking score 当 step reward。
+原因很简单：`std(vy)` 和 `mean(TTC)` 本来就是**整条轨迹统计量**，它天然适合做 episode summary，不适合直接做每一步 dense reward。你可以把它保留成一个额外输出指标，名字就叫 `paper_rank_score_mean`。真正用来画 curve 的主指标，应该是一个**逐步累计的 dense eval reward**。 ([GitHub][3])
+
+也不要直接照搬论文 RL reward 里的
+[
+F_{goal}=-(g_x-p_x)^2-(g_y-p_y)^2.
+]
+你这套代码的环境坐标是英尺，`y` 方向终点量级可以到上千英尺，直接平方会把 goal 项放大到远大于其他项，最后整条曲线几乎只剩“距离项”，安全和舒适都会被淹没。更稳的做法是把它改成**归一化的距离下降量**。 ([GitHub][4])
+
+## 2. 推荐的 eval-only dense reward
+
+按你的要求，先**固定保留现在的 `+0.5` 变道奖励**，其余部分重设计成 dense 评估分数。
+
+我建议每一步评估奖励定义成：
+
+[
+r_t^{eval}
+==========
+
+0.5\cdot \mathbf{1}_{\text{just_merged}}
+
+* 2.0,p_t^{goal}
+* 1.2,p_t^{lane}
+* 0.020,e_t
+* 0.015,s_t^{ttc}
+* 0.010,s_t^{thw}
+
+- 0.015,c_t^{jerk}
+- 0.005,c_t^{acc}
+- 2.0\cdot \mathbf{1}_{\text{collision_new}}
+
+* 0.3\cdot \mathbf{1}_{\text{endpoint_success}}
+* 0.7\cdot \mathbf{1}_{\text{safety_success}}
+  ]
+
+其中各项都做成 ([0,1]) 归一化：
+
+[
+p_t^{goal}=\frac{\max(0, d_{t-1}-d_t)}{d_0+\varepsilon}
+]
+
+[
+p_t^{lane}=\frac{\max(0, \text{lane_gap}*{t-1}-\text{lane_gap}*{t})}{\text{LANE_WIDTH}}
+]
+
+[
+e_t=\text{clip}\left(\frac{v_{y,t}^{m/s}}{15.0},0,1\right)
+]
+
+[
+s_t^{ttc}=\text{clip}\left(\frac{TTC_{min,t}}{4.0},0,1\right),\quad
+s_t^{thw}=\text{clip}\left(\frac{THW_{min,t}}{2.0},0,1\right)
+]
+
+[
+c_t^{jerk}=\text{clip}\left(\frac{|jerk_{y,t}|^{m/s^3}}{3.0},0,1\right),\quad
+c_t^{acc}=\text{clip}\left(\frac{|a_{y,t}|^{m/s^2}}{3.0},0,1\right)
+]
+
+这个形式的优点是：
+
+第一，`goal_progress` 和 `lane_progress` 会让 return **沿轨迹密集累积**，而不是只在终点跳一下。
+第二，效率 / 安全 / 舒适三类项和论文完全同构。
+第三，横向项只保留一个 lane-progress，主体还是 (y) 向，这和论文“横向指标区分度较弱”的做法一致。
+第四，尺度是可控的，一条比较好的 episode 原始总分大约会落在 `6~10` 左右，后处理乘以 `10` 就能变成很顺眼的 `0~100` 曲线。 
+
+这条 reward 会比你现在的 `0/0.5/1/2` 稀疏 return 平滑很多，但我要说清楚：**它能显著减少台阶感，不保证严格单调上升。** 训练本身会波动，reward 只能让“改进更容易被看见”，不能把真实震荡伪装成单调收敛。
+
+## 3. 代码上最稳的落地方式
+
+最安全的实现不是改 `step()` 返回值，而是在 `info` 里新增一条评估 reward。
+
+也就是：
+
+* `step()` 继续返回你现在的 `r_goal`，训练链路完全不动；
+* 在 `info` 里额外塞入：
+
+  * `eval_dense_reward`
+  * `eval_min_ttc`
+  * `eval_min_thw`
+  * `eval_goal_progress`
+  * `eval_lane_progress`
+  * `eval_dense_return`
+
+这样，AIRL / PPO 主线还是原来的 reward net + `goal_bonus=0.5`；评估时再单独累计 `info["eval_dense_reward"]`。这比直接改 `reward` 返回值更稳，因为你仓库里训练器还留着 `debug_use_ground_truth_reward` 入口，未来一旦打开，直接改 `step()` return 就可能误伤训练。([GitHub][5])
+
+### `envs/merging_env.py` 建议新增这两个 helper
+
+```python
+def _compute_min_ttc_thw(self, px, py, vy, surr_data):
+    ego_front_y = py + self.cfg.VEHICLE_LENGTH / 2.0
+    ego_rear_y = py - self.cfg.VEHICLE_LENGTH / 2.0
+
+    ttcs, thws = [], []
+
+    # L6 lead, L5 lead, L5 follow
+    for base in (0, 4, 8):
+        ox = surr_data[base]
+        oy = surr_data[base + 1]
+        ovy = surr_data[base + 2]
+
+        if ox == 0 and oy == 0:
+            continue
+        if abs(ox - px) > self.cfg.LANE_WIDTH:
+            continue
+
+        # vehicle ahead
+        if oy >= py:
+            gap = (oy - self.cfg.VEHICLE_LENGTH / 2.0) - ego_front_y
+            if gap > 0:
+                thws.append(gap / max(vy, 1e-3))
+                rel_v = vy - ovy
+                if rel_v > 0.1:
+                    ttcs.append(gap / rel_v)
+
+        # vehicle behind
+        else:
+            rear_gap = ego_rear_y - (oy + self.cfg.VEHICLE_LENGTH / 2.0)
+            if rear_gap > 0:
+                thws.append(rear_gap / max(ovy, 1e-3))
+                rel_v = ovy - vy
+                if rel_v > 0.1:
+                    ttcs.append(rear_gap / rel_v)
+
+    min_ttc = min(ttcs) if ttcs else 20.0
+    min_thw = min(thws) if thws else 10.0
+    return float(min_ttc), float(min_thw)
+```
+
+```python
+def _compute_eval_dense_reward(
+    self,
+    prev_state,
+    ay_phys,
+    curr_state,
+    surr_now,
+    just_merged,
+    is_endpoint_success,
+    is_safety_success,
+    is_collided_new,
+):
+    ft_to_m = 0.3048
+    px_prev, py_prev, _, _ = prev_state
+    px, py, _, vy = curr_state
+
+    goal_xy = self.current_traj["ego_pos"][-1]
+    lane_target_x = self.cfg.X_MIN + self.cfg.LANE_WIDTH - 3.28
+
+    d_prev = np.linalg.norm(prev_state[:2] - goal_xy)
+    d_curr = np.linalg.norm(curr_state[:2] - goal_xy)
+    p_goal = max(0.0, d_prev - d_curr) / max(self.start_dist_to_goal, 1.0)
+
+    lane_gap_prev = max(0.0, px_prev - lane_target_x)
+    lane_gap_curr = max(0.0, px - lane_target_x)
+    p_lane = max(0.0, lane_gap_prev - lane_gap_curr) / max(self.cfg.LANE_WIDTH, 1e-6)
+
+    vy_mps = vy * ft_to_m
+    ay_mps2 = abs(ay_phys) * ft_to_m
+    jerk_mps3 = abs(ay_phys - self.prev_ay_phys) / self.cfg.DT * ft_to_m
+
+    min_ttc, min_thw = self._compute_min_ttc_thw(px, py, vy, surr_now)
+
+    e_t = np.clip(vy_mps / 15.0, 0.0, 1.0)
+    s_ttc = np.clip(min_ttc / 4.0, 0.0, 1.0)
+    s_thw = np.clip(min_thw / 2.0, 0.0, 1.0)
+    c_jerk = np.clip(jerk_mps3 / 3.0, 0.0, 1.0)
+    c_acc = np.clip(ay_mps2 / 3.0, 0.0, 1.0)
+
+    r_eval = 0.0
+    r_eval += 0.5 if just_merged else 0.0
+    r_eval += 2.0 * p_goal
+    r_eval += 1.2 * p_lane
+    r_eval += 0.020 * e_t
+    r_eval += 0.015 * s_ttc
+    r_eval += 0.010 * s_thw
+    r_eval -= 0.015 * c_jerk
+    r_eval -= 0.005 * c_acc
+    r_eval -= 2.0 if is_collided_new else 0.0
+    r_eval += 0.3 if is_endpoint_success else 0.0
+    r_eval += 0.7 if is_safety_success else 0.0
+
+    return float(r_eval), {
+        "eval_min_ttc": float(min_ttc),
+        "eval_min_thw": float(min_thw),
+        "eval_goal_progress": float(p_goal),
+        "eval_lane_progress": float(p_lane),
+        "eval_vy_mps": float(vy_mps),
+        "eval_abs_jerk_mps3": float(jerk_mps3),
+    }
+```
+
+然后在 `reset()` 初始化：
+
+```python
+goal_xy = self.current_traj["ego_pos"][-1]
+self.start_dist_to_goal = float(np.linalg.norm(self.ego_state[:2] - goal_xy))
+self.prev_ay_phys = 0.0
+self.eval_dense_return = 0.0
+```
+
+在 `step()` 里，保留原来的 `r_goal` 不动，只加：
+
+```python
+prev_state = np.array([px, py, vx, vy], dtype=np.float32)
+just_merged = False
+
+# 原来的 merge 判定逻辑里，把 just_merged 标出来
+if in_target_lane and not self.has_merged:
+    if not self.has_collided_this_episode:
+        r_goal += 0.5
+        just_merged = True
+    self.has_merged = True
+
+...
+
+eval_dense_reward, dense_info = self._compute_eval_dense_reward(
+    prev_state=prev_state,
+    ay_phys=ay,
+    curr_state=self.ego_state,
+    surr_now=surr_now,
+    just_merged=just_merged,
+    is_endpoint_success=is_endpoint_success,
+    is_safety_success=is_safety_success,
+    is_collided_new=is_collided,
+)
+self.eval_dense_return += eval_dense_reward
+self.prev_ay_phys = ay
+
+info.update(dense_info)
+info["eval_dense_reward"] = float(eval_dense_reward)
+info["eval_dense_return"] = float(self.eval_dense_return)
+```
+
+## 4. `evaluate_policy_metrics()` 也一起改
+
+你现在这里累加的是 `reward`，也就是稀疏环境回报。要换成：
+
+* 主曲线：`eval_dense_reward`
+* 辅助曲线：`paper_rank_score_mean`
+
+论文 ranking score 你可以严格按论文算，但建议放成**辅助指标**，不要当主 curve。因为它是 episode summary，不是 dense return。论文公式和你仓库 `data_loader` 里实现的是同一个东西。 ([GitHub][3])
+
+你可以这样改：
+
+```python
+def evaluate_policy_metrics(model, dataset, cfg, n_eval_episodes=20):
+    eval_env = MergingEnv(dataset)
+
+    merge_successes, endpoint_successes, safety_successes = [], [], []
+    dense_episode_rewards = []
+    paper_scores = []
+    episode_lengths = []
+    mean_speeds = []
+    mean_abs_accs = []
+    mean_abs_jerks = []
+    min_ttcs = []
+    min_thws = []
+    collision_flags = []
+
+    for ep_idx in range(n_eval_episodes):
+        obs, _ = eval_env.reset(seed=cfg.SEED + ep_idx)
+
+        terminated = False
+        truncated = False
+        dense_ep_reward = 0.0
+        ep_len = 0
+        info = {}
+
+        speed_trace_mps = []
+        jerk_trace_mps3 = []
+        ttc_trace = []
+        thw_trace = []
+        prev_ay_phys = 0.0
+
+        while not (terminated or truncated):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, terminated, truncated, info = eval_env.step(action)
+
+            dense_ep_reward += float(info.get("eval_dense_reward", 0.0))
+            ep_len += 1
+
+            ay_phys = float(action[1]) * cfg.PHYS_ACC_MAX
+            speed_trace_mps.append(float(info.get("eval_vy_mps", eval_env.ego_state[3] * 0.3048)))
+            jerk_trace_mps3.append(float(info.get("eval_abs_jerk_mps3", abs(ay_phys - prev_ay_phys) / cfg.DT * 0.3048)))
+            ttc_trace.append(float(info.get("eval_min_ttc", 20.0)))
+            thw_trace.append(float(info.get("eval_min_thw", 10.0)))
+            prev_ay_phys = ay_phys
+
+        merge_successes.append(float(info.get("is_merge_success", False)))
+        endpoint_successes.append(float(info.get("is_endpoint_success", False)))
+        safety_successes.append(float(info.get("is_safety_success", False)))
+        collision_flags.append(float(info.get("is_collided", False) or getattr(eval_env, "has_collided_this_episode", False)))
+
+        dense_episode_rewards.append(dense_ep_reward)
+        episode_lengths.append(ep_len)
+        mean_speeds.append(float(np.mean(speed_trace_mps)) if speed_trace_mps else 0.0)
+        mean_abs_accs.append(float(np.mean(np.abs(np.diff([0.0] + speed_trace_mps)))) if len(speed_trace_mps) > 1 else 0.0)
+        mean_abs_jerks.append(float(np.mean(np.abs(jerk_trace_mps3))) if jerk_trace_mps3 else 0.0)
+        min_ttcs.append(float(np.min(ttc_trace)) if ttc_trace else 20.0)
+        min_thws.append(float(np.min(thw_trace)) if thw_trace else 10.0)
+
+        # 论文 ranking score（辅助输出）
+        if speed_trace_mps and jerk_trace_mps3 and ttc_trace:
+            paper_score = (
+                float(np.mean(speed_trace_mps))
+                - float(np.std(speed_trace_mps))
+                + float(np.mean(np.clip(ttc_trace, 0.0, 20.0)))
+                - 5.0 * float(np.mean(np.abs(jerk_trace_mps3)))
+            )
+        else:
+            paper_score = -10.0
+
+        if not info.get("is_endpoint_success", False):
+            paper_score -= 5.0
+        if collision_flags[-1] > 0:
+            paper_score -= 5.0
+
+        paper_scores.append(paper_score)
+
+    dense_mean = float(np.mean(dense_episode_rewards))
+    return {
+        "merge_success_rate": float(np.mean(merge_successes)),
+        "endpoint_success_rate": float(np.mean(endpoint_successes)),
+        "safety_success_rate": float(np.mean(safety_successes)),
+        "collision_rate": float(np.mean(collision_flags)),
+        "eval_dense_return_mean": dense_mean,
+        "eval_dense_return_norm100": 10.0 * dense_mean,
+        "paper_rank_score_mean": float(np.mean(paper_scores)),
+        "eval_ep_len_mean": float(np.mean(episode_lengths)),
+        "mean_speed": float(np.mean(mean_speeds)),
+        "mean_abs_acc": float(np.mean(mean_abs_accs)),
+        "mean_abs_jerk": float(np.mean(mean_abs_jerks)),
+        "min_ttc": float(np.mean(min_ttcs)),
+        "min_thw": float(np.mean(min_thws)),
+    }
+```
+
+这里的 `eval_dense_return_norm100 = 10 * dense_mean` 只是展示尺度，不改排序。
+
+## 5. 每个 epoch 都评估，不再 20 epoch 才评一次
+
+你现在训练脚本是按 `save_freq_epochs=20` 切块训练，也就是先一口气训 `20 * STEPS_PER_EPOCH`，再评估一次。这也是你前面曲线起点偏高的重要原因：第一个点根本不是“初始策略”，而是已经训练了一大段。你当前 run_config 里也确实是 `save_freq_epochs=20`、`n_eval_episodes=20`。([GitHub][5]) 
+
+建议把“保存频率”和“评估频率”解耦：
+
+```python
+save_freq_epochs = 20
+eval_freq_epochs = 1
+quick_eval_episodes = 8
+full_eval_episodes = 20
+
+for epoch in range(1, total_epochs + 1):
+    airl_trainer.train(total_timesteps=cfg.STEPS_PER_EPOCH)
+
+    n_eval = full_eval_episodes if (epoch % save_freq_epochs == 0) else quick_eval_episodes
+    eval_metrics = evaluate_policy_metrics(
+        learner,
+        val_dataset,
+        cfg,
+        n_eval_episodes=n_eval,
+    )
+    append_eval_metrics(log_dir, {
+        "epoch": epoch,
+        "total_timesteps": learner.num_timesteps,
+        **eval_metrics,
+    })
+
+    if epoch % save_freq_epochs == 0:
+        checkpoint_path = f"checkpoints/baseline_policy_{run_label}_epoch_{epoch}.zip"
+        learner.save(checkpoint_path)
+```
+
+这样：
+
+* 每个 epoch 都有一条评估曲线；
+* 但只有每 20 个 epoch 存 checkpoint；
+* 中间 epoch 用 8 个 episodes 做 quick eval，开销不会太大；
+* 20 的倍数再做 20 episodes full eval。([GitHub][5])
+
+## 6. 这套方案最适合你现在的原因
+
+它保留了你当前已经验证过的训练主线：`goal_bonus=0.5` 仍然不动，而且你自己之前的调参总结也说明 `disc=6`、`goal_bonus=0.5` 仍然是当前最平衡的主线。我们不去重做训练 reward，只是把评估口径变得更合理。 
+
+同时，它和论文风格也是一致的：主评价围绕效率、安全、舒适，辅以 success/collision；而不是单纯盯一个 sparse 终点奖励。论文里 GC-AIRL 的优势本来也主要体现在更高速度、更低波动、更高 TTC / headway、更低 jerk，而不是某个单点稀疏奖励突然跳高。 
+
+## 7. 我建议你按这个顺序做
+
+先做第一步：**不动训练 reward，只在 `info` 里加 `eval_dense_reward`**。
+第二步：把 `evaluate_policy_metrics()` 改成累计 `eval_dense_reward`，并同时输出 `paper_rank_score_mean`。
+第三步：把训练循环从“每 20 epoch 评估一次”改成“每 1 epoch quick eval，一到 20 epoch full eval + save”。
+第四步：画两条主曲线：
+
+* `eval_dense_return_norm100`
+* `paper_rank_score_mean`
+
+再配三条辅助曲线：
+
+* `endpoint_success_rate`
+* `safety_success_rate`
+* `collision_rate`
+
+如果你愿意，我下一条可以直接按你这个仓库的文件名，给你整理成**可直接粘贴的 patch 版本**。
+
+[1]: https://raw.githubusercontent.com/xuejiali1234/gym-airl-copy/main/envs/merging_env.py "raw.githubusercontent.com"
+[2]: https://raw.githubusercontent.com/xuejiali1234/gym-airl-copy/main/model/attention_net.py "raw.githubusercontent.com"
+[3]: https://raw.githubusercontent.com/xuejiali1234/gym-airl-copy/main/utils/data_loader.py "raw.githubusercontent.com"
+[4]: https://raw.githubusercontent.com/xuejiali1234/gym-airl-copy/main/configs/config.py "raw.githubusercontent.com"
+[5]: https://github.com/xuejiali1234/gym-airl-copy/blob/main/train_airl_baseline.py "gym-airl-copy/train_airl_baseline.py at main · xuejiali1234/gym-airl-copy · GitHub"

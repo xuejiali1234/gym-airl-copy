@@ -127,20 +127,29 @@ def plot_combined_figures(csv_path, save_dir):
     else:
         axes[2, 1].axis('off')
 
-    safety_reg = get_series(df, ['mean/disc/disc_safety_reg_loss', 'disc_safety_reg_loss'])
-    if safety_reg is None:
-        safety_weight = get_series(df, ['mean/disc/disc_safety_weight', 'disc_safety_weight'])
-        if safety_aux is not None and safety_weight is not None:
-            safety_reg = safety_aux * safety_weight
-
-    if safety_reg is not None:
-        axes[2, 2].plot(iterations, safety_reg, color='#bcbd22', linewidth=2.0)
-        axes[2, 2].set_title('Figure 9: Safety Reg Loss', fontsize=14, fontweight='bold')
+    reward_gap = get_series(df, ['mean/disc/disc_reward_gap', 'disc_reward_gap'])
+    if reward_gap is not None:
+        axes[2, 2].plot(iterations, reward_gap, color='#bcbd22', linewidth=2.0)
+        axes[2, 2].axhline(y=0.0, color='gray', linestyle='-.', linewidth=1.2)
+        axes[2, 2].set_title('Figure 9: Reward Gap (Expert - Gen)', fontsize=14, fontweight='bold')
         axes[2, 2].set_xlabel('Iterations', fontsize=12)
-        axes[2, 2].set_ylabel('Reg Loss', fontsize=12)
+        axes[2, 2].set_ylabel('Reward Gap', fontsize=12)
         axes[2, 2].grid(True, linestyle='--', alpha=0.6)
     else:
-        axes[2, 2].axis('off')
+        safety_reg = get_series(df, ['mean/disc/disc_safety_reg_loss', 'disc_safety_reg_loss'])
+        if safety_reg is None:
+            safety_weight = get_series(df, ['mean/disc/disc_safety_weight', 'disc_safety_weight'])
+            if safety_aux is not None and safety_weight is not None:
+                safety_reg = safety_aux * safety_weight
+
+        if safety_reg is not None:
+            axes[2, 2].plot(iterations, safety_reg, color='#bcbd22', linewidth=2.0)
+            axes[2, 2].set_title('Figure 9: Safety Reg Loss (fallback)', fontsize=14, fontweight='bold')
+            axes[2, 2].set_xlabel('Iterations', fontsize=12)
+            axes[2, 2].set_ylabel('Reg Loss', fontsize=12)
+            axes[2, 2].grid(True, linestyle='--', alpha=0.6)
+        else:
+            axes[2, 2].axis('off')
 
     plt.tight_layout(pad=3.0)
     save_path = os.path.join(save_dir, 'Full_Training_Analysis_9Figs.png')
@@ -153,5 +162,5 @@ def plot_combined_figures(csv_path, save_dir):
 
 if __name__ == '__main__':
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    csv_absolute_path = os.path.join(script_dir, 'baseline_attn_goal_safe_branch_aux_rnorm_20260416_105052', 'progress.csv')
+    csv_absolute_path = os.path.join(script_dir, 'baseline_attn_goal_safe_branch_aux_20260416_220623', 'progress.csv')
     plot_combined_figures(csv_absolute_path, script_dir)

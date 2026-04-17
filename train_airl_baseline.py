@@ -125,84 +125,97 @@ def split_dataset(dataset, train_ratio=0.8, seed=42):
 
 
 def evaluate_policy_metrics(model, dataset, cfg, n_eval_episodes=20):
-    """Runs lightweight periodic evaluation on merge/endpoint success."""
+    """Runs policy evaluation without changing the training reward path."""
     eval_env = MergingEnv(dataset)
     merge_successes = []
     endpoint_successes = []
     safety_successes = []
+    collision_flags = []
     episode_rewards = []
+    dense_episode_rewards = []
+    paper_scores = []
     episode_lengths = []
     mean_speeds = []
     max_speeds = []
     mean_abs_accs = []
+    mean_abs_jerks = []
     min_ttcs = []
-
-    def compute_min_ttc(env):
-        px, py, vx, vy = env.ego_state
-        surr_now = env._get_surround_at_t(env.t)
-        ttcs = []
-        lane_x_tolerance = 10.0
-
-        for idx in (0, 4):
-            tx = surr_now[idx]
-            ty = surr_now[idx + 1]
-            tvy = surr_now[idx + 2]
-            if tx == 0 and ty == 0:
-                continue
-
-            dx = tx - px
-            dy = ty - py
-            if abs(dx) > lane_x_tolerance or dy <= 0.1:
-                continue
-
-            closing_speed = vy - tvy
-            if closing_speed <= 0.1:
-                continue
-
-            ttcs.append(dy / closing_speed)
-
-        return min(ttcs) if ttcs else 20.0
+    min_thws = []
 
     for ep_idx in range(n_eval_episodes):
         obs, _ = eval_env.reset(seed=cfg.SEED + ep_idx)
         terminated = False
         truncated = False
         ep_reward = 0.0
+        dense_ep_reward = 0.0
         ep_len = 0
         info = {}
         speed_trace = []
+        speed_y_mps_trace = []
         abs_acc_trace = []
+        jerk_trace_mps3 = []
         ttc_trace = []
+        thw_trace = []
 
         while not (terminated or truncated):
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, terminated, truncated, info = eval_env.step(action)
             ep_reward += float(reward)
+            dense_ep_reward += float(info.get("eval_dense_reward", 0.0))
             ep_len += 1
             speed_trace.append(float(np.linalg.norm(eval_env.ego_state[2:4])))
             abs_acc_trace.append(float(abs(action[1]) * cfg.PHYS_ACC_MAX))
-            ttc_trace.append(float(compute_min_ttc(eval_env)))
+            speed_y_mps_trace.append(float(info.get("eval_vy_mps", eval_env.ego_state[3] * 0.3048)))
+            jerk_trace_mps3.append(float(info.get("eval_abs_jerk_mps3", 0.0)))
+            ttc_trace.append(float(info.get("eval_min_ttc", 20.0)))
+            thw_trace.append(float(info.get("eval_min_thw", 10.0)))
 
         merge_successes.append(float(info.get("is_merge_success", False)))
         endpoint_successes.append(float(info.get("is_endpoint_success", False)))
         safety_successes.append(float(info.get("is_safety_success", False)))
+        collision_flags.append(float(info.get("is_collided", False) or getattr(eval_env, "has_collided_this_episode", False)))
         episode_rewards.append(ep_reward)
+        dense_episode_rewards.append(dense_ep_reward)
         episode_lengths.append(ep_len)
         mean_speeds.append(float(np.mean(speed_trace)) if speed_trace else 0.0)
         max_speeds.append(float(np.max(speed_trace)) if speed_trace else 0.0)
         mean_abs_accs.append(float(np.mean(abs_acc_trace)) if abs_acc_trace else 0.0)
+        mean_abs_jerks.append(float(np.mean(np.abs(jerk_trace_mps3))) if jerk_trace_mps3 else 0.0)
         min_ttcs.append(float(np.min(ttc_trace)) if ttc_trace else 20.0)
+        min_thws.append(float(np.min(thw_trace)) if thw_trace else 10.0)
 
+        if speed_y_mps_trace and jerk_trace_mps3 and ttc_trace:
+            paper_score = (
+                float(np.mean(speed_y_mps_trace))
+                - float(np.std(speed_y_mps_trace))
+                + float(np.mean(np.clip(ttc_trace, 0.0, 20.0)))
+                - 5.0 * float(np.mean(np.abs(jerk_trace_mps3)))
+            )
+        else:
+            paper_score = -10.0
+        if not info.get("is_endpoint_success", False):
+            paper_score -= 5.0
+        if collision_flags[-1] > 0:
+            paper_score -= 5.0
+        paper_scores.append(paper_score)
+
+    dense_mean = float(np.mean(dense_episode_rewards))
     return {
         "merge_success_rate": float(np.mean(merge_successes)),
         "endpoint_success_rate": float(np.mean(endpoint_successes)),
         "safety_success_rate": float(np.mean(safety_successes)),
+        "collision_rate": float(np.mean(collision_flags)),
         "eval_ep_rew_mean": float(np.mean(episode_rewards)),
+        "eval_dense_return_mean": dense_mean,
+        "eval_dense_return_norm100": 10.0 * dense_mean,
+        "paper_rank_score_mean": float(np.mean(paper_scores)),
         "eval_ep_len_mean": float(np.mean(episode_lengths)),
         "mean_speed": float(np.mean(mean_speeds)),
         "max_speed": float(np.mean(max_speeds)),
         "mean_abs_acc": float(np.mean(mean_abs_accs)),
+        "mean_abs_jerk": float(np.mean(mean_abs_jerks)),
         "min_ttc": float(np.mean(min_ttcs)),
+        "min_thw": float(np.mean(min_thws)),
     }
 
 
@@ -491,7 +504,10 @@ def main():
     chunks = total_epochs // save_freq_epochs
     steps_per_chunk = save_freq_epochs * cfg.STEPS_PER_EPOCH
     base_gen_lr = cfg.GENERATOR_LEARNING_RATE
-    n_eval_episodes = 20
+    eval_freq_epochs = 1
+    quick_eval_episodes = 8
+    full_eval_episodes = 20
+    n_eval_episodes = full_eval_episodes
     safety_unfreeze_timesteps = getattr(cfg, "SAFETY_UNFREEZE_TIMESTEPS", 100000)
     safety_light_unfreeze_lr = getattr(cfg, "SAFETY_LIGHT_UNFREEZE_LR", 1e-5)
     safety_phase = "frozen" if enable_safety else "disabled"
@@ -510,6 +526,9 @@ def main():
                 "deterministic_training": deterministic_training,
                 "n_disc_updates_per_round": n_disc_updates_per_round,
                 "save_freq_epochs": save_freq_epochs,
+                "eval_freq_epochs": eval_freq_epochs,
+                "quick_eval_episodes": quick_eval_episodes,
+                "full_eval_episodes": full_eval_episodes,
                 "n_eval_episodes": n_eval_episodes,
                 "goal_bonus": goal_bonus,
                 "attention_query_uses_goal": False,
@@ -542,7 +561,11 @@ def main():
 
     train_mode = "S-AIRL" if enable_safety else "GC-AIRL no-safety ablation"
     print(f"[*] 开始 {train_mode} 训练...")
-    print(f"[*] 配置: 总 Epoch={total_epochs}, 每 {save_freq_epochs} 个 Epoch 保存一次 Checkpoint")
+    print(
+        f"[*] 配置: total_epochs={total_epochs}, "
+        f"eval_every={eval_freq_epochs} epoch, save_every={save_freq_epochs} epochs, "
+        f"quick_eval_episodes={quick_eval_episodes}, full_eval_episodes={full_eval_episodes}"
+    )
     
     for chunk in range(chunks):
         # ==========================================
@@ -564,26 +587,48 @@ def main():
             )
         # ==========================================
         
-        airl_trainer.train(total_timesteps=steps_per_chunk)
+        last_eval_metrics = {}
+
+        def eval_callback(round_idx):
+            current_eval_epoch = chunk * save_freq_epochs + round_idx + 1
+            is_full_eval = (current_eval_epoch % save_freq_epochs == 0)
+            eval_episodes = full_eval_episodes if is_full_eval else quick_eval_episodes
+            eval_metrics = evaluate_policy_metrics(
+                learner,
+                val_dataset,
+                cfg,
+                n_eval_episodes=eval_episodes,
+            )
+            eval_row = {
+                "epoch": current_eval_epoch,
+                "total_timesteps": learner.num_timesteps,
+                "generator_lr": current_lr,
+                "safety_phase": safety_phase,
+                "eval_n_episodes": eval_episodes,
+                **eval_metrics,
+            }
+            append_eval_metrics(log_dir, eval_row)
+            last_eval_metrics.clear()
+            last_eval_metrics.update(eval_metrics)
+            print(
+                "[*] Epoch eval | "
+                f"epoch={current_eval_epoch}/{total_epochs}, "
+                f"episodes={eval_episodes}, "
+                f"dense_norm100={eval_metrics['eval_dense_return_norm100']:.2f}, "
+                f"paper_rank={eval_metrics['paper_rank_score_mean']:.2f}, "
+                f"merge={eval_metrics['merge_success_rate']:.3f}, "
+                f"endpoint={eval_metrics['endpoint_success_rate']:.3f}, "
+                f"safety={eval_metrics['safety_success_rate']:.3f}, "
+                f"collision={eval_metrics['collision_rate']:.3f}"
+            )
+
+        airl_trainer.train(total_timesteps=steps_per_chunk, callback=eval_callback)
         current_epoch = (chunk + 1) * save_freq_epochs
 
         # 在存档名中也加入架构标记
         checkpoint_path = f"checkpoints/baseline_policy_{run_label}_epoch_{current_epoch}.zip"
         learner.save(checkpoint_path)
-        eval_metrics = evaluate_policy_metrics(
-            learner,
-            val_dataset,
-            cfg,
-            n_eval_episodes=n_eval_episodes,
-        )
-        eval_row = {
-            "epoch": current_epoch,
-            "total_timesteps": learner.num_timesteps,
-            "generator_lr": current_lr,
-            "safety_phase": safety_phase,
-            **eval_metrics,
-        }
-        append_eval_metrics(log_dir, eval_row)
+        eval_metrics = last_eval_metrics
 
         print(
             f"[*] 进度 {current_epoch}/{total_epochs} Epochs -> 模型已保存至: {checkpoint_path}"
@@ -596,8 +641,12 @@ def main():
             f"mean_speed={eval_metrics['mean_speed']:.2f}, "
             f"max_speed={eval_metrics['max_speed']:.2f}, "
             f"mean_abs_acc={eval_metrics['mean_abs_acc']:.2f}, "
+            f"mean_abs_jerk={eval_metrics['mean_abs_jerk']:.2f}, "
             f"min_ttc={eval_metrics['min_ttc']:.2f}, "
+            f"min_thw={eval_metrics['min_thw']:.2f}, "
             f"eval_ep_rew={eval_metrics['eval_ep_rew_mean']:.3f}, "
+            f"dense_norm100={eval_metrics['eval_dense_return_norm100']:.2f}, "
+            f"paper_rank={eval_metrics['paper_rank_score_mean']:.2f}, "
             f"lr={current_lr:.6f}"
         )
 

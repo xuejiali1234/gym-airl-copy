@@ -33,6 +33,9 @@ class MergingEnv(gym.Env):
         self.has_merged = False
         self.collision_margin = 1.0
         self.has_collided_this_episode = False
+        self.start_dist_to_goal = 1.0
+        self.prev_ay_phys = 0.0
+        self.eval_dense_return = 0.0
 
     def reset(self, seed=None, options=None):
         # 必须调用父类的 reset 来处理随机种子
@@ -49,6 +52,10 @@ class MergingEnv(gym.Env):
 
         self.ego_state = np.concatenate([init_pos, init_vel]).astype(np.float32)
         self.start_y = init_pos[1]
+        goal_xy = self.current_traj['ego_pos'][-1]
+        self.start_dist_to_goal = float(np.linalg.norm(self.ego_state[:2] - goal_xy))
+        self.prev_ay_phys = 0.0
+        self.eval_dense_return = 0.0
 
         self.has_merged = False
         self.has_collided_this_episode = False
@@ -98,6 +105,98 @@ class MergingEnv(gym.Env):
                 return True
         return False
 
+    def _compute_min_ttc_thw(self, px, py, vy, surr_data):
+        ego_front_y = py + self.cfg.VEHICLE_LENGTH / 2.0
+        ego_rear_y = py - self.cfg.VEHICLE_LENGTH / 2.0
+        ttcs = []
+        thws = []
+
+        for base in (0, 4, 8):
+            ox = surr_data[base]
+            oy = surr_data[base + 1]
+            ovy = surr_data[base + 2]
+            if ox == 0 and oy == 0:
+                continue
+            if abs(ox - px) > self.cfg.LANE_WIDTH:
+                continue
+
+            if oy >= py:
+                gap = (oy - self.cfg.VEHICLE_LENGTH / 2.0) - ego_front_y
+                if gap > 0:
+                    thws.append(gap / max(vy, 1e-3))
+                    rel_v = vy - ovy
+                    if rel_v > 0.1:
+                        ttcs.append(gap / rel_v)
+            else:
+                rear_gap = ego_rear_y - (oy + self.cfg.VEHICLE_LENGTH / 2.0)
+                if rear_gap > 0:
+                    thws.append(rear_gap / max(ovy, 1e-3))
+                    rel_v = ovy - vy
+                    if rel_v > 0.1:
+                        ttcs.append(rear_gap / rel_v)
+
+        min_ttc = min(ttcs) if ttcs else 20.0
+        min_thw = min(thws) if thws else 10.0
+        return float(min_ttc), float(min_thw)
+
+    def _compute_eval_dense_reward(
+        self,
+        prev_state,
+        ay_phys,
+        curr_state,
+        surr_now,
+        just_merged,
+        is_endpoint_success,
+        is_safety_success,
+        is_collided_new,
+    ):
+        ft_to_m = 0.3048
+        px_prev, _, _, _ = prev_state
+        px, py, _, vy = curr_state
+        goal_xy = self.current_traj['ego_pos'][-1]
+        lane_target_x = self.cfg.X_MIN + self.cfg.LANE_WIDTH - 3.28
+
+        d_prev = np.linalg.norm(prev_state[:2] - goal_xy)
+        d_curr = np.linalg.norm(curr_state[:2] - goal_xy)
+        p_goal = max(0.0, d_prev - d_curr) / max(self.start_dist_to_goal, 1.0)
+
+        lane_gap_prev = max(0.0, px_prev - lane_target_x)
+        lane_gap_curr = max(0.0, px - lane_target_x)
+        p_lane = max(0.0, lane_gap_prev - lane_gap_curr) / max(self.cfg.LANE_WIDTH, 1e-6)
+
+        vy_mps = vy * ft_to_m
+        ay_mps2 = abs(ay_phys) * ft_to_m
+        jerk_mps3 = abs(ay_phys - self.prev_ay_phys) / self.cfg.DT * ft_to_m
+        min_ttc, min_thw = self._compute_min_ttc_thw(px, py, vy, surr_now)
+
+        e_t = np.clip(vy_mps / 15.0, 0.0, 1.0)
+        s_ttc = np.clip(min_ttc / 4.0, 0.0, 1.0)
+        s_thw = np.clip(min_thw / 2.0, 0.0, 1.0)
+        c_jerk = np.clip(jerk_mps3 / 3.0, 0.0, 1.0)
+        c_acc = np.clip(ay_mps2 / 3.0, 0.0, 1.0)
+
+        r_eval = 0.0
+        r_eval += 0.5 if just_merged else 0.0
+        r_eval += 2.0 * p_goal
+        r_eval += 1.2 * p_lane
+        r_eval += 0.020 * e_t
+        r_eval += 0.015 * s_ttc
+        r_eval += 0.010 * s_thw
+        r_eval -= 0.015 * c_jerk
+        r_eval -= 0.005 * c_acc
+        r_eval -= 2.0 if is_collided_new else 0.0
+        r_eval += 0.3 if is_endpoint_success else 0.0
+        r_eval += 0.7 if is_safety_success else 0.0
+
+        return float(r_eval), {
+            'eval_min_ttc': float(min_ttc),
+            'eval_min_thw': float(min_thw),
+            'eval_goal_progress': float(p_goal),
+            'eval_lane_progress': float(p_lane),
+            'eval_vy_mps': float(vy_mps),
+            'eval_abs_jerk_mps3': float(jerk_mps3),
+        }
+
     def step(self, action):
         steer_max = getattr(self.cfg, 'PHYS_STEER_MAX', 8.0)
         acc_max = getattr(self.cfg, 'PHYS_ACC_MAX', 15.0)
@@ -106,6 +205,7 @@ class MergingEnv(gym.Env):
         ay = action[1] * acc_max
 
         px, py, vx, vy = self.ego_state
+        prev_state = np.array([px, py, vx, vy], dtype=np.float32)
         dt = self.cfg.DT
 
         vx_new = vx + ax * dt
@@ -148,6 +248,7 @@ class MergingEnv(gym.Env):
 
         surr_now = self._get_surround_at_t(self.t)
         is_collided = self._check_collision(px_new, py_new, surr_now)
+        is_collided_new = is_collided and (not self.has_collided_this_episode)
 
         if is_collided:
             self.has_collided_this_episode = True
@@ -173,11 +274,13 @@ class MergingEnv(gym.Env):
         in_target_lane = px_new < (divider_x - 3.28)
 
         r_goal = 0.0
+        just_merged = False
 
         if is_in_bounds:
             if in_target_lane and not self.has_merged:
                 if not self.has_collided_this_episode:
                     r_goal += 0.5
+                    just_merged = True
                     self.has_merged = True
 
         is_merge_success = self.has_merged
@@ -195,13 +298,29 @@ class MergingEnv(gym.Env):
         if is_safety_success:
             r_goal += 1.0
 
+        eval_dense_reward, dense_info = self._compute_eval_dense_reward(
+            prev_state=prev_state,
+            ay_phys=ay,
+            curr_state=self.ego_state,
+            surr_now=surr_now,
+            just_merged=just_merged,
+            is_endpoint_success=is_endpoint_success,
+            is_safety_success=is_safety_success,
+            is_collided_new=is_collided_new,
+        )
+        self.eval_dense_return += eval_dense_reward
+        self.prev_ay_phys = ay
+
         info = {
             'is_success': is_endpoint_success,
             'is_merge_success': is_merge_success,
             'is_endpoint_success': is_endpoint_success,
             'is_safety_success': is_safety_success,
             'is_collided': is_collided,
+            'eval_dense_reward': float(eval_dense_reward),
+            'eval_dense_return': float(self.eval_dense_return),
         }
+        info.update(dense_info)
         return self._get_obs(), r_goal, terminated, truncated, info
 
     def _get_obs(self):

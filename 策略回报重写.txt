@@ -1,0 +1,96 @@
+严格地说，你现在**已经有 policy return** 了：就是 `eval_ep_rew_mean`。因为你仓库里的 `evaluate_policy_metrics()` 是新建一个 `MergingEnv(dataset)`，然后在评估循环里反复执行 `obs, reward, ... = eval_env.step(action)`，把这个 `reward` 累加成 `ep_reward`，最后返回 `eval_ep_rew_mean`。所以它不是 AIRL 的 wrapped reward，也不是判别器 reward，而是**环境侧 evaluation reward 的 episode return**。([GitHub][1])
+
+你之所以觉得这个 return 范围“太小”，是因为你当前环境 reward 本来就很小：首次成功并入目标车道加 `0.5`，endpoint success 再加 `0.5`，safety success 再加 `1.0`。也就是说，一条安全完成的 episode，原始环境 return 的上限就是 `2.0`。所以画出来落在 `0–2` 区间，不是异常，而是**reward 设计如此**。AIRL 原论文里，transfer learning 的 learning curve 画的是“policy 的 return”；同时，论文在展示 learned reward 图时还明确说过，为了可视化会先减去一个常数 offset，让不同 reward 共享同一均值。这两件事是分开的。([GitHub][2])
+
+`imitation` 的 AIRL 示例也是同样口径：训练前后用 `evaluate_policy` 去评估 policy 的 episodic reward；SB3 文档里 `eval/mean_reward` 也明确定义为“评估时的 mean episodic reward”。所以，**论文里要画的 policy return，最干净的做法就是固定一个 evaluation reward，然后一直在这个 reward 下评估 policy**。([Imitation][3])
+
+你这里还要再区分一层：训练侧的 AIRL wrapped reward，和环境侧的 policy return，不是同一个量。你仓库里的 `GoalRewardWrapper` 继承自 `PredictProcessedWrapper`，只重写了 `predict_processed()`；而 `imitation` 文档也说明 `PredictProcessedWrapper` 改的是 `predict_processed` 行为，`AdversarialTrainer` 会把环境包装成 `reward_train` 来训练 generator，且 `reward_train` 是训练 generator 的 reward，`reward_test` 才是测试时用的 unshaped reward。也就是说，你现在看到的负的 wrapped reward，和你要拿来给论文画 policy return 的环境 episodic return，本来就不该混在一起。([GitHub][4])
+
+所以，若你的目标是“画一个**合理、论文里站得住脚**的 policy return 曲线”，最推荐的办法不是改 reward 语义，而是只做**正比例缩放**：
+
+[
+R_{\text{policy,100}} = 100 \cdot \frac{R_{\text{env}}}{2.0} = 50 \cdot R_{\text{env}}
+]
+
+这里 `2.0` 就是你当前环境 reward 的总预算：`0.5 + 0.5 + 1.0`。这样做之后：
+
+* `0` 表示完全失败
+* `25` 大致对应“只完成 merge bonus”
+* `50` 大致对应“到达终点但不安全”
+* `100` 表示安全完成任务
+
+这条曲线**仍然是 policy return**，只是单位从 “0–2 reward units” 改成了 “0–100 normalized return points”。因为你没有改 reward 的排序、没有改正负方向、也没有镜像，它在语义上是干净的。底层依据还是你当前环境 reward 定义和评估函数。([GitHub][2])
+
+你可以直接这样改：
+
+```python
+# 在 evaluate_policy_metrics() 里，现有 episode_rewards 已经是环境 episodic return
+reward_budget = 0.5 + 0.5 + 1.0  # merge + endpoint + safety
+
+policy_return_raw = float(np.mean(episode_rewards))
+policy_return_norm100 = 100.0 * policy_return_raw / reward_budget
+
+return {
+    "merge_success_rate": float(np.mean(merge_successes)),
+    "endpoint_success_rate": float(np.mean(endpoint_successes)),
+    "safety_success_rate": float(np.mean(safety_successes)),
+    "eval_ep_rew_mean": policy_return_raw,
+    "policy_return_norm100": policy_return_norm100,
+    "eval_ep_len_mean": float(np.mean(episode_lengths)),
+    "mean_speed": float(np.mean(mean_speeds)),
+    "max_speed": float(np.mean(max_speeds)),
+    "mean_abs_acc": float(np.mean(mean_abs_accs)),
+    "min_ttc": float(np.mean(min_ttcs)),
+}
+```
+
+然后论文里把这条曲线标成：
+
+**Policy Return (env reward, normalized to 0–100)**
+
+这就是我最建议你放主图的版本。
+
+另一条路，是你确实想让曲线更“平滑、更像常见 RL 回报曲线”。那就不要再叫它 raw policy return，而要定义一个**单独的 evaluation reward**，只用于评估，不进训练。比如：
+
+[
+r^{eval}*t =
+20 \cdot \frac{\max(0,\Delta y_t)}{y^**{\text{end}}-y_0+\epsilon}
+-0.05\frac{|a_y|}{a_{\max}}
+-0.02\frac{|a_x|}{\delta_{\max}}
+-0.10\max(0,1-\mathrm{TTC}_t/5)
+]
+
+终止时再加：
+
+[
++20\mathbf{1}*{merge}
++20\mathbf{1}*{endpoint}
++40\mathbf{1}*{safe}
+-40\mathbf{1}*{collision}
+]
+
+这样得到的 curve 会更连续，因为它把纵向进展、平滑性和风险都密集地计进去了。但这时你图例必须写成：
+
+**Evaluation Task Score**
+或者
+**Policy Return under Dense Evaluation Reward**
+
+不能再直接写成你原环境的 raw return。
+
+结合你现在的代码和配置，最省事的执行方案其实是：
+
+1. **主图**：画 `policy_return_norm100`。
+2. 同时把 `endpoint_success_rate`、`safety_success_rate` 乘以 100 画成百分比。
+3. **附图/补充材料**：放 `gen/rollout/ep_rew_wrapped_mean`，并注明它是 AIRL training reward，不是 environment return。
+4. 不改训练参数。你当前 run 的有效主线参数还是 `goal_bonus=0.5`、`n_disc_updates_per_round=6`、`safety_phase_initial="frozen"`，而且你这轮配置还保留了 `save_freq_epochs=20`，所以完全可以对已有 checkpoint 重新离线评估并重画曲线，不必重训。
+
+一句话总结：
+
+* **想画真正的 policy return**：用你现有 `eval_ep_rew_mean`，只做 `×50` 的正比例缩放。
+* **想画更平滑、更“常见”的曲线**：定义单独的 dense evaluation reward，但名字改成 `evaluation score` 或 `policy return under evaluation reward`。
+* **不要**用镜像、翻转、围绕 0 对称这种办法后还把它叫 policy return。这样语义就变了。
+
+[1]: https://raw.githubusercontent.com/xuejiali1234/gym-airl-copy/main/train_airl_baseline.py "https://raw.githubusercontent.com/xuejiali1234/gym-airl-copy/main/train_airl_baseline.py"
+[2]: https://raw.githubusercontent.com/xuejiali1234/gym-airl-copy/main/envs/merging_env.py "https://raw.githubusercontent.com/xuejiali1234/gym-airl-copy/main/envs/merging_env.py"
+[3]: https://imitation.readthedocs.io/en/latest/algorithms/airl.html "https://imitation.readthedocs.io/en/latest/algorithms/airl.html"
+[4]: https://raw.githubusercontent.com/xuejiali1234/gym-airl-copy/main/model/attention_net.py "https://raw.githubusercontent.com/xuejiali1234/gym-airl-copy/main/model/attention_net.py"
