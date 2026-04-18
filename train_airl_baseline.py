@@ -529,6 +529,7 @@ def main():
                 "eval_freq_epochs": eval_freq_epochs,
                 "quick_eval_episodes": quick_eval_episodes,
                 "full_eval_episodes": full_eval_episodes,
+                "epoch0_eval_episodes": full_eval_episodes,
                 "n_eval_episodes": n_eval_episodes,
                 "goal_bonus": goal_bonus,
                 "attention_query_uses_goal": False,
@@ -567,6 +568,34 @@ def main():
         f"quick_eval_episodes={quick_eval_episodes}, full_eval_episodes={full_eval_episodes}"
     )
     
+    epoch0_metrics = evaluate_policy_metrics(
+        learner,
+        val_dataset,
+        cfg,
+        n_eval_episodes=full_eval_episodes,
+    )
+    append_eval_metrics(
+        log_dir,
+        {
+            "epoch": 0,
+            "total_timesteps": learner.num_timesteps,
+            "generator_lr": base_gen_lr,
+            "safety_phase": safety_phase,
+            "eval_n_episodes": full_eval_episodes,
+            **epoch0_metrics,
+        },
+    )
+    print(
+        "[*] Epoch 0 eval | "
+        f"episodes={full_eval_episodes}, "
+        f"dense_norm100={epoch0_metrics['eval_dense_return_norm100']:.2f}, "
+        f"paper_rank={epoch0_metrics['paper_rank_score_mean']:.2f}, "
+        f"merge={epoch0_metrics['merge_success_rate']:.3f}, "
+        f"endpoint={epoch0_metrics['endpoint_success_rate']:.3f}, "
+        f"safety={epoch0_metrics['safety_success_rate']:.3f}, "
+        f"collision={epoch0_metrics['collision_rate']:.3f}"
+    )
+
     for chunk in range(chunks):
         # ==========================================
         # 手动实现两阶段学习率退火

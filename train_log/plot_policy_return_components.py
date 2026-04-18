@@ -3,6 +3,7 @@ import sys
 
 import matplotlib.pyplot as plt
 import pandas as pd
+from matplotlib.ticker import MaxNLocator
 
 
 plt.rcParams["font.family"] = "Times New Roman"
@@ -16,7 +17,7 @@ SAFETY_REWARD = 1.0
 REWARD_BUDGET = MERGE_REWARD + ENDPOINT_REWARD + SAFETY_REWARD
 NORM_SCALE = 100.0 / REWARD_BUDGET
 
-SMOOTH_WINDOW = 3
+SMOOTH_WINDOW = 20
 SHADE_ALPHA = 0.16
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -87,13 +88,27 @@ def plot_policy_return_components(eval_csv_path, save_dir, smooth_window=SMOOTH_
     df = pd.read_csv(eval_csv_path)
     comp = build_policy_return_components(df)
     x = comp["epoch"].to_numpy()
+    # The top panel uses only its own policy-return series to set the lower y-limit.
+    top_policy_return_y_min = float(comp["policy_return_norm100"].min())
+    component_y_min = float(
+        pd.concat(
+            [
+                comp["merge_component_norm100"],
+                comp["endpoint_component_norm100"],
+                comp["safety_component_norm100"],
+                comp["component_sum_norm100"],
+            ],
+            ignore_index=True,
+        ).min()
+    )
 
     max_abs_diff = (comp["policy_return_raw"] - comp["component_sum_raw"]).abs().max()
     print(f"[*] Environment reward budget = {REWARD_BUDGET:.1f}")
     print(f"[*] Normalized policy return: R_norm100 = {NORM_SCALE:.1f} * eval_ep_rew_mean")
     print(f"[*] Max |eval_ep_rew_mean - component_sum| = {max_abs_diff:.6f}")
+    print(f"[*] Y-axis min | top_policy_return={top_policy_return_y_min:.3f}, components={component_y_min:.3f}")
 
-    fig, axes = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+    fig, axes = plt.subplots(2, 1, figsize=(9, 10), sharex=True)
 
     # Panel 1: total policy return, scaled to 0-100.
     plot_line_with_shadow(
@@ -103,19 +118,13 @@ def plot_policy_return_components(eval_csv_path, save_dir, smooth_window=SMOOTH_
         color="#1f77b4",
         label="Policy Return (env reward, normalized to 0-100)",
     )
-    axes[0].plot(
-        x,
-        comp["component_sum_norm100"],
-        color="#111111",
-        linewidth=1.6,
-        linestyle="--",
-        label="Merge + Endpoint + Safety components",
-    )
     axes[0].set_title("Policy Return Under Environment Reward", fontsize=15, fontweight="bold")
     axes[0].set_ylabel("Normalized Return (0-100)", fontsize=12)
-    axes[0].set_ylim(0, 105)
+    axes[0].set_ylim(top_policy_return_y_min, 105)
+    axes[0].set_xlim(float(x.min()), float(x.max()))
+    axes[0].margins(x=0)
     axes[0].grid(True, linestyle="--", alpha=0.6)
-    axes[0].legend(loc="lower right", fontsize=10)
+    axes[0].legend(loc="best", fontsize=10)
 
     # Panel 2: separated normalized component contributions.
     plot_line_with_shadow(
@@ -139,10 +148,21 @@ def plot_policy_return_components(eval_csv_path, save_dir, smooth_window=SMOOTH_
         color="#d62728",
         label="Safety contribution: 50 * safety_success_rate",
     )
+    axes[1].plot(
+        x,
+        comp["component_sum_norm100"],
+        color="#111111",
+        linewidth=1.6,
+        linestyle="--",
+        label="Component sum: merge + endpoint + safety",
+    )
     axes[1].set_title("Policy Return Components", fontsize=15, fontweight="bold")
     axes[1].set_xlabel("Epoch", fontsize=12)
     axes[1].set_ylabel("Normalized Return Points", fontsize=12)
-    axes[1].set_ylim(0, 55)
+    axes[1].set_ylim(component_y_min, 105)
+    axes[1].set_xlim(float(x.min()), float(x.max()))
+    axes[1].margins(x=0)
+    axes[1].xaxis.set_major_locator(MaxNLocator(nbins=8, integer=True))
     axes[1].grid(True, linestyle="--", alpha=0.6)
     axes[1].legend(loc="best", fontsize=10)
 

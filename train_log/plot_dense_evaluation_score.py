@@ -33,6 +33,7 @@ OUTPUT_FIG = os.path.join(RUN_DIR, f"Dense_Eval_Score_{RUN_LABEL}.png")
 N_EVAL_EPISODES = 20
 SMOOTH_WINDOW = 3
 SHADE_ALPHA = 0.16
+EPS = 1e-8
 
 
 def split_dataset(dataset, train_ratio=0.8, seed=42):
@@ -129,7 +130,26 @@ def dense_eval_terminal_bonus(info):
     return bonus
 
 
-def evaluate_dense_score(model, dataset, cfg, n_eval_episodes=N_EVAL_EPISODES):
+class RandomPolicy:
+    """Uniform random policy used only as the dense-score reference baseline."""
+
+    def __init__(self, seed=42):
+        self.rng = np.random.default_rng(seed)
+
+    def predict(self, obs, deterministic=True):
+        action = self.rng.uniform(-1.0, 1.0, size=2).astype(np.float32)
+        return action, None
+
+
+def expert_action_provider(env, obs, ep_idx):
+    actions = env.current_traj.get("action")
+    if actions is None or len(actions) == 0:
+        return np.zeros(2, dtype=np.float32)
+    action_idx = min(int(env.t), len(actions) - 1)
+    return np.asarray(actions[action_idx], dtype=np.float32)
+
+
+def evaluate_dense_score(model, dataset, cfg, n_eval_episodes=N_EVAL_EPISODES, action_provider=None):
     env = MergingEnv(dataset)
     dense_scores = []
     env_returns = []
@@ -151,7 +171,10 @@ def evaluate_dense_score(model, dataset, cfg, n_eval_episodes=N_EVAL_EPISODES):
 
         while not (terminated or truncated):
             prev_y = float(env.ego_state[1])
-            action, _ = model.predict(obs, deterministic=True)
+            if action_provider is not None:
+                action = action_provider(env, obs, ep_idx)
+            else:
+                action, _ = model.predict(obs, deterministic=True)
             obs, reward, terminated, truncated, info = env.step(action)
             ttc = compute_min_ttc(env)
 
@@ -186,13 +209,24 @@ def smooth(series, window=SMOOTH_WINDOW):
     return series.rolling(window=window, min_periods=1, center=True).mean()
 
 
+def add_random_normalized_score(df, random_mean, expert_mean):
+    raw_denom = float(expert_mean) - float(random_mean)
+    denom = raw_denom if abs(raw_denom) > EPS else EPS
+    df = df.copy()
+    df["dense_eval_score_random_baseline"] = float(random_mean)
+    df["dense_eval_score_expert_baseline"] = float(expert_mean)
+    df["dense_eval_score_rel_mean"] = 100.0 * (df["dense_eval_score_mean"] - random_mean) / denom
+    df["dense_eval_score_rel_std"] = 100.0 * df["dense_eval_score_std"].fillna(0.0) / abs(denom)
+    return df
+
+
 def plot_dense_results(df, save_path):
     fig, axes = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
     x = df["epoch"].to_numpy()
 
-    dense = df["dense_eval_score_mean"]
+    dense = df["dense_eval_score_rel_mean"]
     dense_smooth = smooth(dense)
-    dense_std = df["dense_eval_score_std"].fillna(0.0)
+    dense_std = df["dense_eval_score_rel_std"].fillna(0.0)
     axes[0].fill_between(
         x,
         (dense_smooth - dense_std).to_numpy(),
@@ -201,9 +235,11 @@ def plot_dense_results(df, save_path):
         alpha=SHADE_ALPHA,
         linewidth=0,
     )
-    axes[0].plot(x, dense_smooth, color="#1f77b4", linewidth=2.3, label="Dense Evaluation Score")
+    axes[0].plot(x, dense_smooth, color="#1f77b4", linewidth=2.3, label="Random-Normalized Dense Score")
+    axes[0].axhline(0.0, color="#666666", linestyle="--", linewidth=1.2, label="Random baseline")
+    axes[0].axhline(100.0, color="#111111", linestyle=":", linewidth=1.2, label="Expert baseline")
     axes[0].set_title("Policy Return Under Dense Evaluation Reward", fontsize=15, fontweight="bold")
-    axes[0].set_ylabel("Dense Evaluation Score", fontsize=12)
+    axes[0].set_ylabel("Relative Score (random=0, expert=100)", fontsize=12)
     axes[0].grid(True, linestyle="--", alpha=0.6)
     axes[0].legend(loc="best", fontsize=10)
 
@@ -233,6 +269,30 @@ def main():
     dataset = MergingDataset(data_paths, device="cpu")
     _, val_dataset = split_dataset(dataset, train_ratio=0.8, seed=cfg.SEED)
 
+    print("[*] Evaluating random baseline...")
+    random_policy = RandomPolicy(seed=cfg.SEED)
+    random_stats = evaluate_dense_score(
+        random_policy,
+        val_dataset,
+        cfg,
+        n_eval_episodes=N_EVAL_EPISODES,
+    )
+    print("[*] Evaluating expert baseline...")
+    expert_stats = evaluate_dense_score(
+        None,
+        val_dataset,
+        cfg,
+        n_eval_episodes=N_EVAL_EPISODES,
+        action_provider=expert_action_provider,
+    )
+    random_mean = random_stats["dense_eval_score_mean"]
+    expert_mean = expert_stats["dense_eval_score_mean"]
+    print(
+        "[*] Dense score baselines | "
+        f"random={random_mean:.3f}, expert={expert_mean:.3f}, "
+        f"denom={expert_mean - random_mean:.3f}"
+    )
+
     checkpoints = []
     for path in glob.glob(CHECKPOINT_GLOB):
         epoch = checkpoint_epoch(path)
@@ -243,14 +303,16 @@ def main():
         raise FileNotFoundError(f"No checkpoints found: {CHECKPOINT_GLOB}")
 
     rows = []
+    rows.append({"epoch": 0, "source": "random_baseline", **random_stats})
     for epoch, path in checkpoints:
         print(f"[*] Evaluating epoch {epoch}: {path}")
         model = PPO.load(path, device="cpu")
-        row = {"epoch": epoch}
+        row = {"epoch": epoch, "source": "checkpoint"}
         row.update(evaluate_dense_score(model, val_dataset, cfg, n_eval_episodes=N_EVAL_EPISODES))
         rows.append(row)
 
     df = pd.DataFrame(rows).sort_values("epoch")
+    df = add_random_normalized_score(df, random_mean=random_mean, expert_mean=expert_mean)
     df.to_csv(OUTPUT_CSV, index=False)
     print(f"Saved dense evaluation table to: {OUTPUT_CSV}")
     plot_dense_results(df, OUTPUT_FIG)

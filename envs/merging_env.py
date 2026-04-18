@@ -169,9 +169,10 @@ class MergingEnv(gym.Env):
         jerk_mps3 = abs(ay_phys - self.prev_ay_phys) / self.cfg.DT * ft_to_m
         min_ttc, min_thw = self._compute_min_ttc_thw(px, py, vy, surr_now)
 
-        e_t = np.clip(vy_mps / 15.0, 0.0, 1.0)
-        s_ttc = np.clip(min_ttc / 4.0, 0.0, 1.0)
-        s_thw = np.clip(min_thw / 2.0, 0.0, 1.0)
+        # Eval-only dense shaping: center always-positive survival terms at zero.
+        e_t = np.clip(vy_mps / 15.0, 0.0, 1.0) - 0.5
+        s_ttc = np.clip(min_ttc / 4.0, 0.0, 1.0) - 0.5
+        s_thw = np.clip(min_thw / 2.0, 0.0, 1.0) - 0.5
         c_jerk = np.clip(jerk_mps3 / 3.0, 0.0, 1.0)
         c_acc = np.clip(ay_mps2 / 3.0, 0.0, 1.0)
 
