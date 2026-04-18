@@ -1,4 +1,5 @@
 import os
+import sys
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -17,6 +18,11 @@ NORM_SCALE = 100.0 / REWARD_BUDGET
 
 SMOOTH_WINDOW = 3
 SHADE_ALPHA = 0.16
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+RUN_NAME = "baseline_attn_goal_safe_branch_aux_20260417_224439"
+RUN_DIR = os.path.join(SCRIPT_DIR, RUN_NAME)
+DEFAULT_EVAL_CSV = os.path.join(RUN_DIR, "eval_metrics.csv")
 
 
 def get_series(df, name):
@@ -152,10 +158,6 @@ def plot_policy_return_components(eval_csv_path, save_dir, smooth_window=SMOOTH_
 
 
 if __name__ == "__main__":
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    eval_csv = os.path.join(
-        script_dir,
-        "baseline_attn_goal_safe_branch_aux_20260416_220623",
-        "eval_metrics.csv",
-    )
-    plot_policy_return_components(eval_csv, script_dir)
+    eval_csv = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_EVAL_CSV
+    save_dir = os.path.dirname(eval_csv) if len(sys.argv) > 1 else RUN_DIR
+    plot_policy_return_components(eval_csv, save_dir)

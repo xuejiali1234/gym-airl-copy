@@ -14,6 +14,9 @@ plt.rcParams["font.family"] = "Times New Roman"
 plt.rcParams["axes.unicode_minus"] = False
 
 SMOOTH_WINDOW = 5
+RUN_NAME = "baseline_attn_goal_safe_branch_aux_20260417_224439"
+RUN_DIR = os.path.join(SCRIPT_DIR, RUN_NAME)
+DEFAULT_EVAL_CSV = os.path.join(RUN_DIR, "eval_metrics.csv")
 
 
 def smooth(series, window=SMOOTH_WINDOW):
@@ -65,10 +68,10 @@ def plot_eval_dense_metrics(eval_csv_path, save_dir=None):
 
 
 if __name__ == "__main__":
-    latest_eval = sys.argv[1] if len(sys.argv) > 1 else os.path.join(SCRIPT_DIR, "eval_metrics.csv")
+    latest_eval = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_EVAL_CSV
     if not os.path.exists(latest_eval):
         raise FileNotFoundError(
-            "Pass a run eval_metrics.csv path, for example: "
-            "python train_log/plot_eval_dense_metrics.py train_log/<run>/eval_metrics.csv"
+            "Set RUN_NAME at the top of this script, or pass a run eval_metrics.csv path, "
+            "for example: python train_log/plot_eval_dense_metrics.py train_log/<run>/eval_metrics.csv"
         )
     plot_eval_dense_metrics(latest_eval)

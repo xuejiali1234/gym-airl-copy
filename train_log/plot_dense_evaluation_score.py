@@ -22,10 +22,13 @@ from utils.data_loader import MergingDataset
 plt.rcParams["font.family"] = "Times New Roman"
 plt.rcParams["axes.unicode_minus"] = False
 
-RUN_LABEL = "attn_goal_safe_branch_aux"
+RUN_NAME = "baseline_attn_goal_safe_branch_aux_20260417_224439"
+RUN_DIR = os.path.join(SCRIPT_DIR, RUN_NAME)
+RUN_LABEL = re.sub(r"_\d{8}_\d{6}$", "", RUN_NAME)
+RUN_LABEL = re.sub(r"^baseline_", "", RUN_LABEL)
 CHECKPOINT_GLOB = os.path.join(REPO_ROOT, "checkpoints", f"baseline_policy_{RUN_LABEL}_epoch_*.zip")
-OUTPUT_CSV = os.path.join(SCRIPT_DIR, f"Dense_Eval_Score_{RUN_LABEL}.csv")
-OUTPUT_FIG = os.path.join(SCRIPT_DIR, f"Dense_Eval_Score_{RUN_LABEL}.png")
+OUTPUT_CSV = os.path.join(RUN_DIR, f"Dense_Eval_Score_{RUN_LABEL}.csv")
+OUTPUT_FIG = os.path.join(RUN_DIR, f"Dense_Eval_Score_{RUN_LABEL}.png")
 
 N_EVAL_EPISODES = 20
 SMOOTH_WINDOW = 3

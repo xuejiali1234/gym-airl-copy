@@ -75,7 +75,7 @@ if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))
     csv_absolute_path = os.path.join(
         script_dir,
-        "baseline_attn_goal_safe_branch_aux_20260416_220623",
+        "baseline_attn_goal_safe_branch_aux_20260417_224439",
         "progress.csv",
     )
     plot_reward_means(csv_absolute_path, script_dir)
