@@ -1,0 +1,206 @@
+我按这次你刚 push 的 `gym-airl-copy` 重新看了一遍，结论要改成下面这样：
+
+**这次仓库比上次“更接近你想要的实验形态”了。**
+你现在已经把三件关键事做进去了：
+一是环境里保留原来的稀疏 `r_goal`，同时单独计算 `eval_dense_reward` 放进 `info`；二是 `evaluate_policy_metrics()` 同时统计环境回报、dense eval return 和 `paper_rank_score_mean`；三是训练脚本已经支持 `epoch 0` 评估、每个 epoch 评估，以及 `8` episode 的 quick eval 和 `20` episode 的 full eval。也就是说，这次 repo 里，“训练口径”和“评估口径”已经基本分开了。([GitHub][1])
+
+更具体地说，当前环境 `step()` 仍然返回稀疏环境奖励：首次进入目标车道 `+0.5`，endpoint success 再 `+0.5`，safety success 再 `+1.0`；但它另外又计算了一条 **eval-only dense reward**，并通过 `info["eval_dense_reward"]` 暴露出来。你新加的 dense shaping 里，速度、TTC、THW 这三项已经做了零中心化，也就是都减了 `0.5`，这比你之前那版“天然正基线”的设计更合理。([GitHub][1])
+
+同时，训练主路径依然没变：`GoalRewardWrapper` 只改 `predict_processed()`，只是在策略训练看到的 reward 上加一次性的 merge bonus `0.5`；它没有改 reward net 的 `forward()`。所以你现在的 **dense eval reward 不会反向污染 AIRL 训练目标**，这一点是对的。([GitHub][2])
+
+---
+
+## 这次代码下，哪些判断要修正
+
+第一，**当前模型不是“没有爬升”**。
+我直接重看了你上传的 `eval_metrics.csv`。如果只看 full-eval checkpoint，模型从 `epoch 0` 到中后期其实有明显提升：
+`epoch 0` 大约是 `merge=0.15 / endpoint=0.45 / safety=0.20 / collision=0.30 / eval_ep_rew=0.50 / dense_norm100=32.8`；
+到 `epoch 200` 已经到 `0.75 / 1.00 / 0.65 / 0.35 / 1.525 / 36.0`；
+`epoch 240` 是这轮最像 best checkpoint 的点，约 `0.75 / 1.00 / 0.90 / 0.10 / 1.775 / 40.6`；
+`epoch 300` 则是 `0.60 / 0.90 / 0.85 / 0.10 / 1.60 / 40.4`。
+所以这轮更像是“**先明显提升，后面轻微回落**”，不是“从头到尾都没学到”。
+
+第二，**`Policy_Return_Components_Norm100` 这张图本来就不该长成经典 RL 那种平滑爬升曲线**。
+因为它本质上就是
+[
+25\cdot merge_success + 25\cdot endpoint_success + 50\cdot safety_success
+]
+是三条 success rate 的离散加权和，而不是 dense return。当前 `evaluate_policy_metrics()` 里，`eval_ep_rew_mean` 也是直接把环境 `step()` 返回的 `reward` 累加起来；而环境 `step()` 返回的正是那个稀疏 `r_goal`。所以这张 component 图天然会是**台阶化、抖动、可回落**的，不能拿它当“主学习曲线”。([GitHub][3])
+
+第三，**现在 raw dense score 仍然不会从 0 开始**。
+原因不是代码错，而是设计上如此：`reset()` 还是从真实专家轨迹的起始位置和速度起跑，不是随机乱状态；而 dense reward 里 `p_goal` 和 `p_lane` 只要车还在向正确方向推进，就会持续给正分。也就是说，哪怕是未训练策略，也会有一个不低的 eval-only dense baseline。你如果想让主图从 0 起步，仍然要画 **random-normalized score**，而不是原始 `eval_dense_return_norm100`。([GitHub][1])
+
+第四，**`paper_rank_score_mean` 也不适合作为主 learning curve**。
+它对应的是论文里的 trajectory ranking score，
+[
+(\bar v_y-\sigma_{v_y})+\overline{TTC}-5\overline{|jerk|}
+]
+本质上是整条轨迹的效率/安全/舒适 summary，不是训练 return。论文主评估也不是“reward 曲线是否单调上升”，而是 merging success、平均速度、速度波动、TTC、headway、collision、jerk 这些指标。你现在代码里 `paper_rank_score_mean` 更适合当辅助指标，而不是主图。 
+
+---
+
+## 这轮训练到底健康不健康
+
+这次 repo 下，训练状态要比你之前那版判断得更细一点：
+
+**不是全程死掉，但中期确实有一次明显失稳。**
+
+前段到中段，大约 `6.35e4` timesteps 左右，你这轮日志出现了典型的 “PPO 几乎不动，critic 在硬追” 的形态：
+`approx_kl ≈ 3.32e-05`、`clip_fraction = 0`、`explained_variance ≈ 0.123`、`value_loss ≈ 799`。这说明那一段 actor 基本没更新，value learning 也很吃力。
+
+但和你上次贴错仓库时不同，这次**后面是恢复了的**。
+在大约 `3.52e5` timesteps 时，日志已经回到 `approx_kl ≈ 0.007`、`clip_fraction ≈ 0.0216`、`explained_variance ≈ 0.9`、`value_loss ≈ 121`，说明 PPO 后面又重新进入了有效更新区。到最终附近，大约 `6.14e5` timesteps，`approx_kl ≈ 0.00332`、`clip_fraction ≈ 0.00537`、`explained_variance ≈ 0.986`、`value_loss ≈ 26.2`，所以这轮 run 不能再归类成“PPO 全程死掉”。 
+
+不过，当前结构里仍有一个没修掉的系统性风险：
+AIRL trainer 还是 `allow_variable_horizon=True`，而你的日志开头也明确打了这个 warning。这个设置会让 episode 长度本身泄漏信息，也更容易让曲线解释变得混乱。它不一定是这轮性能波动的主因，但它确实是当前 repo 里还没彻底处理干净的结构项。([GitHub][3]) 
+
+---
+
+## 现在要不要“大调参”
+
+我的建议是：
+
+**要做轻量 probe，但先不要大改模型结构。**
+
+原因很简单。
+当前 repo 的主结构已经比较完整了：
+
+* 注意力开着
+* goal condition 开着
+* safety module / safety branch / safety aux 都开着
+* `goal_bonus = 0.5`
+* `n_disc_updates_per_round = 6`
+* `PPO_EPOCHS = 8`
+* `GENERATOR_LEARNING_RATE = 8e-5`
+* `DISCRIMINATOR_LEARNING_RATE = 5e-5`
+* reward normalization 仍是关的。([GitHub][4]) 
+
+而且 safety 这条线当前是**整轮 frozen**。配置里 `SAFETY_UNFREEZE_TIMESTEPS = EPOCHS * STEPS_PER_EPOCH + 1`，再配合你当前 `EPOCHS=300, STEPS_PER_EPOCH=2048`，意味着 unfreeze 条件根本不会触发，所以整个 run 都停在 frozen safety prior。换句话说，这轮的主问题并不是“安全分支后期乱跳”，而更像是 **PPO 更新节奏 + 对抗平衡中期失稳**。([GitHub][4]) 
+
+所以当前最值得扫的，不是 architecture，不是 goal_bonus，也不是 safety 结构，而是**训练节奏参数**。
+
+---
+
+## 我建议的 probe 顺序
+
+先固定不动：
+
+* `ENABLE_ATTENTION = True`
+* `ENABLE_GOAL_CONDITION = True`
+* `ENABLE_SAFETY_MODULE = True`
+* `ENABLE_SAFETY_BRANCH = True`
+* `ENABLE_SAFETY_AUX_LOSS = True`
+* `goal_bonus = 0.5`
+* `n_disc_updates_per_round = 6`
+* safety phase 继续 frozen
+
+先扫这三类最可能改变“中期塌一下、后面才恢复”现象的参数：
+
+### 第一优先级
+
+`PPO_EPOCHS: 8 -> 6`
+
+这是我最先试的。你当前 repo 里 PPO 每轮 epoch 数偏高，而你这轮最明显的问题恰恰出现在 critic 追 moving reward、actor 又几乎不动的区间。先把每轮 PPO 迭代减一点，通常最容易让曲线更稳。([GitHub][4])
+
+### 第二优先级
+
+`GENERATOR_LEARNING_RATE: 8e-5 -> 7e-5`
+
+这会比直接大动判别器更稳。你现在后面其实能恢复，说明 generator 不是完全学不动，而是节奏偏冲。
+
+### 第三优先级
+
+只开一次
+`ENABLE_REWARD_NORMALIZATION = True`
+
+因为你当前 repo 已经接了 `NormalizedRewardNet`，这是最温和的“稳定 reward 尺度”手段。它比去改 raw reward 符号、镜像曲线都干净得多。([GitHub][3])
+
+我建议 probe 就跑这 4 组：
+
+* A: `PPO_EPOCHS=8, GENERATOR_LR=8e-5`，当前 baseline
+* B: `PPO_EPOCHS=6, GENERATOR_LR=8e-5`
+* C: `PPO_EPOCHS=6, GENERATOR_LR=7e-5`
+* D: `PPO_EPOCHS=8, GENERATOR_LR=7e-5`
+
+如果 A/B/C/D 都还是中期明显塌，再单独补一个：
+
+* E: 在 C 基础上 `ENABLE_REWARD_NORMALIZATION=True`
+
+---
+
+## 当前 repo 能不能做“探针快速测试”
+
+**能，但现在还是半自动。**
+
+好消息是：
+这次 repo 已经有 `epoch 0 + 每 epoch eval + quick/full eval`，而且训练循环里本来就通过 callback 在 chunk 内每个 epoch 做评估，所以**逻辑上已经适合做 probe**。([GitHub][3])
+
+不太方便的地方是：
+`save_freq_epochs=20`、`eval_freq_epochs=1`、`quick_eval_episodes=8`、`full_eval_episodes=20`、`goal_bonus=0.5`、`n_disc_updates_per_round=6` 这些值还写在 `train_airl_baseline.py` 里，不是命令行 override。也就是说，你现在能快速试，但还不能“一条命令批量 sweep”。([GitHub][3])
+
+最省事的 probe 做法是：
+
+把 `train_airl_baseline.py` 里这几行临时改成：
+
+```python
+save_freq_epochs = 10
+eval_freq_epochs = 1
+quick_eval_episodes = 4
+full_eval_episodes = 10
+```
+
+再把 `Config` 里的：
+
+```python
+EPOCHS = 100
+```
+
+这样你一次 probe 只跑 100 epoch，但会有：
+
+* epoch 0 一次 full eval
+* 每个 epoch 一次 quick eval
+* 每 10 epoch 一次 full eval + save
+
+这对看“中期会不会塌”和“后段能不能回稳”已经够用了。
+
+---
+
+## 这轮图该怎么解释
+
+按这次 repo 标准，我建议你论文里这样分工：
+
+主图放
+**`eval_dense_return_norm100`，只取 full-eval 点**。
+也就是 `epoch 0, 10, 20, ..., 100` 这种 full-eval 点，不要把 8-episode quick eval 和 20-episode full eval 混成一条主曲线。
+
+辅图放
+**`merge / endpoint / safety / collision`**。
+这几条是解释性最好、也最接近论文评价口径的。论文本来就是围绕 success、efficiency、safety、comfort 来报告，不是要求 raw reward 必须像 Atari 一样单调上升。 
+
+`Policy_Return_Components_Norm100` 可以保留，但别再拿它当“主 learning curve”。
+它更适合解释“当前分数主要是 safety 在涨，还是 endpoint 在涨”。
+
+---
+
+## 我这次给你的最终判断
+
+按这次 `gym-airl-copy` 仓库为准：
+
+**1. 你现在的评估设计已经基本走对了。**
+上次我强调的 dense eval-only reward、epoch0 eval、每 epoch eval，你这次都已经做进去了。([GitHub][1])
+
+**2. 当前模型并不是没学到。**
+full-eval checkpoint 明显提升，当前 best 候选仍然是 **epoch 240**，不是 final。
+
+**3. 现在最该做的是“小范围稳定性调参”，不是重构模型。**
+优先扫 `PPO_EPOCHS` 和 `GENERATOR_LEARNING_RATE`，其次再试 reward normalization。
+
+**4. 你现在想要的“主图像 RL 一样从低分爬升到高分再收敛”，不要再寄希望于 `Policy_Return_Components_Norm100`。**
+那张图的数学结构决定了它不会变成你想要的那种形状。真正该拿来当主图的是 full-eval 版 `eval_dense_return_norm100`。
+
+如果你接下来要动手，我建议直接把 probe 入口补成 JSON override，这样你后面试 4 组参数就不用反复改源码了。
+
+[1]: https://raw.githubusercontent.com/xuejiali1234/gym-airl-copy/main/envs/merging_env.py "raw.githubusercontent.com"
+[2]: https://raw.githubusercontent.com/xuejiali1234/gym-airl-copy/main/model/attention_net.py "raw.githubusercontent.com"
+[3]: https://raw.githubusercontent.com/xuejiali1234/gym-airl-copy/main/train_airl_baseline.py "raw.githubusercontent.com"
+[4]: https://raw.githubusercontent.com/xuejiali1234/gym-airl-copy/main/configs/config.py "raw.githubusercontent.com"

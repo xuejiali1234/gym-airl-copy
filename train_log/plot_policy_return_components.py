@@ -21,7 +21,7 @@ SMOOTH_WINDOW = 20
 SHADE_ALPHA = 0.16
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-RUN_NAME = "baseline_attn_goal_safe_branch_aux_20260417_224439"
+RUN_NAME = "baseline_attn_goal_safe_branch_aux_20260418_180202"
 RUN_DIR = os.path.join(SCRIPT_DIR, RUN_NAME)
 DEFAULT_EVAL_CSV = os.path.join(RUN_DIR, "eval_metrics.csv")
 

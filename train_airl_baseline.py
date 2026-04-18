@@ -229,8 +229,65 @@ def append_eval_metrics(log_dir, row):
             writer.writeheader()
         writer.writerow(row)
 
+
+def parse_env_bool(name):
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    value = value.strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean environment value for {name}: {value}")
+
+
+def sanitize_run_tag(tag):
+    if not tag:
+        return ""
+    keep = []
+    for ch in tag.strip():
+        if ch.isalnum() or ch in {"_", "-"}:
+            keep.append(ch)
+        else:
+            keep.append("_")
+    return "".join(keep).strip("_")
+
+
+def apply_probe_overrides(cfg):
+    """Apply optional environment overrides for short probe/sweep runs."""
+    overrides = {}
+
+    def set_if_present(env_name, attr_name, caster):
+        raw_value = os.environ.get(env_name)
+        if raw_value is None or raw_value == "":
+            return
+        value = caster(raw_value)
+        setattr(cfg, attr_name, value)
+        overrides[attr_name] = value
+
+    set_if_present("PROBE_EPOCHS", "EPOCHS", int)
+    set_if_present("PROBE_PPO_EPOCHS", "PPO_EPOCHS", int)
+    set_if_present("PROBE_GENERATOR_LR", "GENERATOR_LEARNING_RATE", float)
+    set_if_present("PROBE_DISCRIMINATOR_LR", "DISCRIMINATOR_LEARNING_RATE", float)
+    set_if_present("PROBE_SAFETY_REG_COEFF", "SAFETY_REGULATOR_COEFF", float)
+    set_if_present("PROBE_ENT_COEF", "PPO_ENT_COEF", float)
+    set_if_present("PROBE_SAVE_FREQ_EPOCHS", "PROBE_SAVE_FREQ_EPOCHS", int)
+    set_if_present("PROBE_QUICK_EVAL_EPISODES", "PROBE_QUICK_EVAL_EPISODES", int)
+    set_if_present("PROBE_FULL_EVAL_EPISODES", "PROBE_FULL_EVAL_EPISODES", int)
+    set_if_present("PROBE_N_DISC_UPDATES", "PROBE_N_DISC_UPDATES", int)
+
+    reward_norm = parse_env_bool("PROBE_REWARD_NORM")
+    if reward_norm is not None:
+        cfg.ENABLE_REWARD_NORMALIZATION = reward_norm
+        overrides["ENABLE_REWARD_NORMALIZATION"] = reward_norm
+
+    return overrides
+
 def main():
     cfg = Config()
+    probe_overrides = apply_probe_overrides(cfg)
+    probe_tag = sanitize_run_tag(os.environ.get("PROBE_TAG", ""))
     deterministic_training = getattr(cfg, "DETERMINISTIC_TRAINING", True)
     seed_everything(cfg.SEED, deterministic=deterministic_training)
     device = torch.device("cpu")
@@ -267,14 +324,21 @@ def main():
     if debug_use_ground_truth_reward:
         stabilizer_tags.append("gt")
     stabilizer_str = "_" + "_".join(stabilizer_tags) if stabilizer_tags else ""
-    run_label = f"{arch_str}_{goal_str}_{safety_str}{stabilizer_str}"
+    probe_str = f"_probe_{probe_tag}" if probe_tag else ""
+    run_label = f"{arch_str}_{goal_str}_{safety_str}{stabilizer_str}{probe_str}"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir = os.path.join("train_log", f"baseline_{run_label}_{timestamp}")
+    checkpoint_dir = os.path.join(log_dir, "checkpoints") if probe_tag else "checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
     
     custom_logger = init_logger(folder=log_dir, format_strs=["stdout", "csv", "log"])
     print(f"[*] 日志系统已就绪，所有训练数据将保存在: {log_dir}")
     print(f"[*] 当前网络架构: {'Attention (跳跃拼接)' if enable_attention else 'Pure MLP'}")
     print(f"[*] Repro seed={cfg.SEED}, deterministic={deterministic_training}")
+    if probe_tag:
+        print(f"[*] Probe tag: {probe_tag}")
+    if probe_overrides:
+        print(f"[*] Probe overrides: {probe_overrides}")
     print(f"[*] Reward normalization: {'NormalizedRewardNet(RunningNorm)' if enable_reward_norm else 'disabled'}")
     print(f"[*] Debug ground-truth reward: {debug_use_ground_truth_reward}")
     if enable_safety:
@@ -464,14 +528,14 @@ def main():
         batch_size=cfg.PPO_MINI_BATCH_SIZE,
         learning_rate=cfg.GENERATOR_LEARNING_RATE,
         n_epochs=cfg.PPO_EPOCHS,
-        ent_coef=0.005,  
+        ent_coef=getattr(cfg, "PPO_ENT_COEF", 0.005),
         clip_range=0.2,
         target_kl=0.01,         
         policy_kwargs=policy_kwargs,
         seed=cfg.SEED,
     )
 
-    n_disc_updates_per_round = 6
+    n_disc_updates_per_round = getattr(cfg, "PROBE_N_DISC_UPDATES", 6)
     trainer_kwargs = dict(
         demonstrations=expert_trajectories,
         demo_batch_size=256,
@@ -499,14 +563,19 @@ def main():
     # ==========================================
     # 4. 切块训练与定期保存 (Chunked Training)
     # ==========================================
-    save_freq_epochs = 20
+    save_freq_epochs = getattr(cfg, "PROBE_SAVE_FREQ_EPOCHS", 20)
     total_epochs = cfg.EPOCHS
+    if total_epochs % save_freq_epochs != 0:
+        raise ValueError(
+            f"EPOCHS ({total_epochs}) must be divisible by save_freq_epochs ({save_freq_epochs}) "
+            "for the current chunked trainer."
+        )
     chunks = total_epochs // save_freq_epochs
     steps_per_chunk = save_freq_epochs * cfg.STEPS_PER_EPOCH
     base_gen_lr = cfg.GENERATOR_LEARNING_RATE
     eval_freq_epochs = 1
-    quick_eval_episodes = 8
-    full_eval_episodes = 20
+    quick_eval_episodes = getattr(cfg, "PROBE_QUICK_EVAL_EPISODES", 8)
+    full_eval_episodes = getattr(cfg, "PROBE_FULL_EVAL_EPISODES", 20)
     n_eval_episodes = full_eval_episodes
     safety_unfreeze_timesteps = getattr(cfg, "SAFETY_UNFREEZE_TIMESTEPS", 100000)
     safety_light_unfreeze_lr = getattr(cfg, "SAFETY_LIGHT_UNFREEZE_LR", 1e-5)
@@ -522,9 +591,16 @@ def main():
             "reference_run": "baseline_attn_20260412_183104",
             "config": config_to_dict(cfg),
             "effective_params": {
+                "probe_tag": probe_tag,
+                "probe_overrides": probe_overrides,
+                "checkpoint_dir": checkpoint_dir,
                 "seed": cfg.SEED,
                 "deterministic_training": deterministic_training,
                 "n_disc_updates_per_round": n_disc_updates_per_round,
+                "ppo_epochs": cfg.PPO_EPOCHS,
+                "ppo_ent_coef": getattr(cfg, "PPO_ENT_COEF", 0.005),
+                "generator_learning_rate": cfg.GENERATOR_LEARNING_RATE,
+                "discriminator_learning_rate": cfg.DISCRIMINATOR_LEARNING_RATE,
                 "save_freq_epochs": save_freq_epochs,
                 "eval_freq_epochs": eval_freq_epochs,
                 "quick_eval_episodes": quick_eval_episodes,
@@ -655,7 +731,7 @@ def main():
         current_epoch = (chunk + 1) * save_freq_epochs
 
         # 在存档名中也加入架构标记
-        checkpoint_path = f"checkpoints/baseline_policy_{run_label}_epoch_{current_epoch}.zip"
+        checkpoint_path = os.path.join(checkpoint_dir, f"baseline_policy_{run_label}_epoch_{current_epoch}.zip")
         learner.save(checkpoint_path)
         eval_metrics = last_eval_metrics
 
@@ -682,8 +758,9 @@ def main():
     # ==========================================
     # 5. 保存最终模型
     # ==========================================
-    learner.save(f"checkpoints/airl_policy_baseline_{run_label}_final.zip")
-    print(f"\n训练全部完成，最终策略已保存为 airl_policy_baseline_{run_label}_final.zip。")
+    final_checkpoint_path = os.path.join(checkpoint_dir, f"airl_policy_baseline_{run_label}_final.zip")
+    learner.save(final_checkpoint_path)
+    print(f"\n训练全部完成，最终策略已保存为 {final_checkpoint_path}。")
 
 if __name__ == "__main__":
     main()

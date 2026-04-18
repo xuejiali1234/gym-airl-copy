@@ -14,7 +14,7 @@ plt.rcParams["font.family"] = "Times New Roman"
 plt.rcParams["axes.unicode_minus"] = False
 
 SMOOTH_WINDOW = 5
-RUN_NAME = "baseline_attn_goal_safe_branch_aux_20260417_224439"
+RUN_NAME = "baseline_attn_goal_safe_branch_aux_20260418_180202"
 RUN_DIR = os.path.join(SCRIPT_DIR, RUN_NAME)
 DEFAULT_EVAL_CSV = os.path.join(RUN_DIR, "eval_metrics.csv")
 

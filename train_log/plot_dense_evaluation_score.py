@@ -22,7 +22,7 @@ from utils.data_loader import MergingDataset
 plt.rcParams["font.family"] = "Times New Roman"
 plt.rcParams["axes.unicode_minus"] = False
 
-RUN_NAME = "baseline_attn_goal_safe_branch_aux_20260417_224439"
+RUN_NAME = "baseline_attn_goal_safe_branch_aux_20260418_180202"
 RUN_DIR = os.path.join(SCRIPT_DIR, RUN_NAME)
 RUN_LABEL = re.sub(r"_\d{8}_\d{6}$", "", RUN_NAME)
 RUN_LABEL = re.sub(r"^baseline_", "", RUN_LABEL)
