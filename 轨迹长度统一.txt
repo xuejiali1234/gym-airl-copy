@@ -1,0 +1,386 @@
+影响**不小**，而且对你这套 AIRL 代码来说，不是“一个无关紧要的安全开关”。`imitation` 官方文档明确把 variable horizon 当成会**泄漏奖励信息**、并且“**不官方支持**”的设置：固定 horizon 才是推荐做法；如果 episode 长度随成功/失败/超时改变，算法会学到“终止条件”这条侧信道，而不只是学行为本身。你当前训练脚本又是**显式**把 `allow_variable_horizon=True` 传给 AIRL trainer 的。([Imitation][1])
+
+对你这个 repo，这个影响我会判断为**中到大**。因为你环境里的 done 不是“无关紧要的小条件”，而是直接编码了任务语义：
+到 merge deadline 还在辅助车道就 `terminated=True`，到达目标附近也 `terminated=True`，否则超时上限又是 `len(current_traj['ego_pos']) + 50`，而 `reset()` 每次还会随机抽一条轨迹，所以**每个 episode 的最大长度本身就跟抽到的 expert 轨迹长度绑定**。这意味着“成功/失败/这条 expert 轨迹有多长”都会泄漏到 horizon 里。([GitHub][2])
+
+更关键的是，**你现在如果只把 `allow_variable_horizon=True` 改成 `False`，大概率会直接报错**，而不是自动变成 fixed horizon。原因有两个：
+第一，expert demonstrations 现在是直接按原长度打包成 `Trajectory(obs=full_obs, acts=acts, terminal=True)`，没有任何 pad/clip；第二，env rollout 的 episode 长度也会因成功/失败/轨迹长度而变化。`imitation` 的基类在 `allow_variable_horizon=False` 时会检查所有 seen horizons，只要出现不同长度就抛 `ValueError`。([GitHub][3])
+
+所以，结论是：
+
+**值得改，而且如果你想让实验更可信，应该改。**
+但它带来的主要好处是“**结果更可信、偏置更少**”，不是“训练曲线立刻就会像普通 PPO 一样单调平滑”。AIRL 仍然是对抗训练，改成 fixed horizon 以后，波动会少一个来源，但不会神奇变成监督学习那种稳定下降。([Imitation][4])
+
+---
+
+## 你这套代码里，固定 horizon 要怎么做
+
+要做成**真正的 fixed horizon**，必须同时改 3 处：
+
+1. **expert demonstrations**
+2. **训练环境 rollout**
+3. **AIRL trainer 开关**
+
+只改其中一个都不够。
+
+---
+
+## 先说最重要的实现原则
+
+### 不要只加 `TimeLimit`
+
+只加 Gymnasium 的 `TimeLimit` 不够，因为你环境内部现在会主动 `terminated=True`。`TimeLimit` 只能限制最大步数，**不能屏蔽早停**。你这里要的是：**无论成功还是失败，episode 都跑满同一个 H**。([GitHub][2])
+
+### 推荐做“absorbing-tail fixed horizon”
+
+也就是：
+
+* 成功 / 失败事件一旦发生，**不再结束 episode**
+* 而是把状态“冻结”到一个 absorbing tail
+* 一直跑到固定步数 `H`
+* 只有到 `t == H` 时才 `truncated=True`
+
+这是你这个项目里最稳、改动也最可控的做法。
+
+---
+
+## 第一步：给配置加 fixed horizon
+
+你现在 `MergingEnv` 在构造函数里直接 `self.cfg = Config()`，不是从训练脚本传入 cfg；同时训练脚本里又是 `MergingEnv(train_dataset)` 和 `MergingEnv(dataset)` 这种调用。
+所以如果你想让 fixed horizon 配置真正生效，**最好把 env 改成能接收 cfg**，否则训练脚本里的运行时改动不会自然传进去。([GitHub][2])
+
+先在 `configs/config.py` 里加：
+
+```python
+USE_FIXED_HORIZON = True
+FIXED_HORIZON = None           # 训练开始时自动推断
+FIXED_HORIZON_EXTRA_STEPS = 50 # 先和你当前 env 语义保持一致
+```
+
+我建议你第一版的 `H` 用：
+
+```python
+H = max(len(traj["action"]) for traj in train_dataset.trajectories) + FIXED_HORIZON_EXTRA_STEPS
+```
+
+这是最稳妥的第一版。
+它的优点是不会裁掉任何 expert 轨迹；缺点是会有一些 padding。
+等第一版跑通之后，再考虑把 `max` 换成 `95% 分位数`，减少尾部 padding。
+
+---
+
+## 第二步：把 demonstrations 统一成同一个长度
+
+你当前的 `convert_to_trajectories()` 没有做任何 horizon 对齐，直接保留了原始 `acts` 长度。这里必须改。([GitHub][3])
+
+可以直接改成这样：
+
+```python
+def infer_fixed_horizon(dataset, cfg):
+    demo_lens = [len(traj["action"]) for traj in dataset.trajectories]
+    if len(demo_lens) == 0:
+        raise ValueError("Empty dataset")
+    extra = int(getattr(cfg, "FIXED_HORIZON_EXTRA_STEPS", 50))
+    return int(max(demo_lens) + extra)
+
+
+def pad_or_clip_demo(full_obs, acts, horizon):
+    """Make every demo length exactly horizon.
+    full_obs shape: [T+1, obs_dim]
+    acts shape: [T, act_dim]
+    """
+    T = len(acts)
+    if T >= horizon:
+        return full_obs[:horizon + 1].copy(), acts[:horizon].copy()
+
+    pad_n = horizon - T
+    pad_obs = np.repeat(full_obs[-1][None, :], pad_n, axis=0)
+    pad_act = np.zeros((pad_n, acts.shape[1]), dtype=acts.dtype)
+
+    full_obs = np.concatenate([full_obs, pad_obs], axis=0)   # -> [H+1, obs_dim]
+    acts = np.concatenate([acts, pad_act], axis=0)           # -> [H, act_dim]
+    return full_obs, acts
+
+
+def convert_to_trajectories(dataset, cfg):
+    trajectories = []
+    enable_goal = getattr(cfg, "ENABLE_GOAL_CONDITION", False)
+    horizon = getattr(cfg, "FIXED_HORIZON", None)
+
+    for traj in dataset.trajectories:
+        obs = traj["state"]
+        acts = traj["action"]
+
+        final_next_state = traj["next_state"][-1].reshape(1, -1)
+        full_obs = np.concatenate([obs, final_next_state], axis=0)
+
+        if enable_goal:
+            obs_goal = traj["goal"]
+            final_goal = obs_goal[-1].reshape(1, -1)
+            full_obs_goal = np.concatenate([obs_goal, final_goal], axis=0)
+            full_obs = np.concatenate([full_obs, full_obs_goal], axis=-1)
+
+        if horizon is not None:
+            full_obs, acts = pad_or_clip_demo(full_obs, acts, horizon)
+
+        trajectories.append(Trajectory(obs=full_obs, acts=acts, infos=None, terminal=True))
+
+    return trajectories
+```
+
+然后在 `train_airl_baseline.py` 里，切分数据后、构造 demonstrations 前加：
+
+```python
+if getattr(cfg, "USE_FIXED_HORIZON", False):
+    if getattr(cfg, "FIXED_HORIZON", None) is None:
+        cfg.FIXED_HORIZON = infer_fixed_horizon(train_dataset, cfg)
+    print(f"[*] Fixed horizon enabled: H={cfg.FIXED_HORIZON}")
+```
+
+---
+
+## 第三步：把环境改成“只在固定 H 结束”
+
+这是核心。
+
+你当前 env 的可变 horizon 来自 3 个地方：
+
+* 抽到不同长度的 `current_traj`
+* 提前成功 `dist_to_end < goal_tolerance`
+* 提前失败 `py_new > MERGE_DEADLINE and in_aux_lane`
+  ([GitHub][2])
+
+### 3.1 先改 env 构造函数
+
+把 `MergingEnv` 改成：
+
+```python
+class MergingEnv(gym.Env):
+    def __init__(self, dataset, cfg=None):
+        super(MergingEnv, self).__init__()
+        self.dataset = dataset
+        self.cfg = cfg if cfg is not None else Config()
+
+        self.use_fixed_horizon = bool(getattr(self.cfg, "USE_FIXED_HORIZON", False))
+        self.fixed_horizon = getattr(self.cfg, "FIXED_HORIZON", None)
+
+        self.absorbing = False
+        self.absorb_obs = None
+        self.goal_reached = False
+        self.deadline_failed = False
+        self.endpoint_success_latched = False
+```
+
+然后 reset 里把这些状态清零：
+
+```python
+def reset(self, seed=None, options=None):
+    super().reset(seed=seed)
+    idx = int(self.np_random.integers(0, len(self.dataset)))
+    self.current_traj = self.dataset[idx]
+    self.t = 0
+
+    init_pos = self.current_traj["ego_pos"][0].copy()
+    init_vel = self.current_traj["ego_vel"][0].copy()
+    self.ego_state = np.concatenate([init_pos, init_vel]).astype(np.float32)
+
+    self.start_y = init_pos[1]
+    goal_xy = self.current_traj["ego_pos"][-1]
+    self.start_dist_to_goal = float(np.linalg.norm(self.ego_state[:2] - goal_xy))
+    self.prev_ay_phys = 0.0
+    self.eval_dense_return = 0.0
+    self.has_merged = False
+    self.has_collided_this_episode = False
+
+    self.absorbing = False
+    self.absorb_obs = None
+    self.goal_reached = False
+    self.deadline_failed = False
+    self.endpoint_success_latched = False
+
+    return self._get_obs(), {}
+```
+
+### 3.2 再改 step 逻辑
+
+推荐逻辑是：
+
+* **成功 / 失败时不结束**
+* 只把它们记录成 latch flag
+* 进入 absorbing tail
+* 直到 `t >= FIXED_HORIZON` 才 `truncated=True`
+
+最小改法如下：
+
+```python
+def step(self, action):
+    # ---------- absorbing tail ----------
+    if self.use_fixed_horizon and self.absorbing:
+        self.t += 1
+
+        terminated = False
+        truncated = self.t >= self.fixed_horizon
+
+        r_goal = 0.0
+        is_merge_success = self.has_merged
+        is_endpoint_success = truncated and self.endpoint_success_latched
+        is_safety_success = truncated and self.endpoint_success_latched and (not self.has_collided_this_episode)
+
+        if truncated and is_endpoint_success:
+            r_goal += 0.5
+        if truncated and is_safety_success:
+            r_goal += 1.0
+
+        info = {
+            "is_success": is_endpoint_success,
+            "is_merge_success": is_merge_success,
+            "is_endpoint_success": is_endpoint_success,
+            "is_safety_success": is_safety_success,
+            "is_collided": self.has_collided_this_episode,
+            "eval_dense_reward": 0.0,
+            "eval_dense_return": float(self.eval_dense_return),
+        }
+
+        obs = self.absorb_obs if self.absorb_obs is not None else self._get_obs()
+        return obs, r_goal, terminated, truncated, info
+
+    # ---------- normal dynamics ----------
+    prev_state = self.ego_state.copy()
+    # 这里保留你原来的动力学更新代码
+    # 更新 self.ego_state / self.t / collision / dense reward ...
+```
+
+然后把你原来的 done 逻辑分两支：
+
+```python
+# 原有逻辑算出来:
+hit_deadline = (py_new > MERGE_DEADLINE and in_aux_lane)
+hit_goal = (dist_to_end < goal_tolerance)
+
+if self.use_fixed_horizon:
+    terminated = False
+
+    if hit_goal:
+        self.goal_reached = True
+        self.endpoint_success_latched = (not in_aux_lane)
+        self.absorbing = True
+
+    if hit_deadline:
+        self.deadline_failed = True
+        self.absorbing = True
+
+    truncated = (self.t >= self.fixed_horizon)
+else:
+    terminated = False
+    truncated = False
+
+    if hit_deadline:
+        terminated = True
+    if hit_goal:
+        terminated = True
+    if self.t >= len(self.current_traj["ego_pos"]) + 50:
+        truncated = True
+```
+
+最后，把 endpoint / safety success 改成分 fixed / non-fixed 两套：
+
+```python
+if self.use_fixed_horizon:
+    is_endpoint_success = truncated and self.endpoint_success_latched
+    is_safety_success = truncated and self.endpoint_success_latched and (not self.has_collided_this_episode)
+else:
+    is_endpoint_success = is_in_bounds and (terminated or truncated) and (dist_to_end < goal_tolerance) and (not in_aux_lane)
+    is_safety_success = is_in_bounds and (terminated or truncated) and (dist_to_end < goal_tolerance) and (not self.has_collided_this_episode) and (not in_aux_lane)
+```
+
+merge bonus 还是保留第一次成功并线时发，不需要改。
+endpoint/safety bonus 改成**只在固定 H 的最后一步发**。
+
+### 3.3 为什么我推荐 absorbing tail，而不是继续跑真实动力学
+
+因为你当前成功/失败条件本身就是任务定义的一部分。
+如果你只是“不提前终止，但继续真跑”，那 agent 到了目标后还会继续乱跑，或者错过 deadline 后还有机会继续纠正，这会把任务语义改掉。
+absorbing tail 的好处是：**去掉 done 泄漏，但保留当前任务语义。**
+
+---
+
+## 第四步：训练和评估都要用同一个 cfg
+
+因为你当前是：
+
+* 训练环境：`MergingEnv(train_dataset)`
+* 评估环境：`MergingEnv(dataset)`
+  ([GitHub][3])
+
+所以都要改成：
+
+```python
+def make_train_env():
+    raw_env = MergingEnv(train_dataset, cfg)
+    return Monitor(
+        raw_env,
+        info_keywords=("is_success", "is_merge_success", "is_endpoint_success", "is_safety_success"),
+    )
+
+# evaluate_policy_metrics
+eval_env = MergingEnv(dataset, cfg)
+```
+
+否则你训练是 fixed horizon，评估还是 variable horizon，口径就又分裂了。
+
+---
+
+## 第五步：最后才把 trainer 改成 False
+
+上面 1–4 都做好后，再把：
+
+```python
+allow_variable_horizon=True
+```
+
+改成：
+
+```python
+allow_variable_horizon=False
+```
+
+你现在 trainer 这行就在 `train_airl_baseline.py` 里。([GitHub][3])
+
+---
+
+## 我对“影响到底有多大”的判断
+
+如果你按上面做成真正 fixed horizon，我预计会出现这几种现象：
+
+第一，**一些当前看起来很强的 checkpoint 可能会掉分。**
+这不一定是坏事，反而可能说明以前确实吃到了 termination leak。
+
+第二，**曲线会更可信，但不一定更平滑。**
+AIRL 仍然是对抗训练，fixed horizon 只能去掉一部分偏置，不能把 AIRL 变成普通 PPO。
+
+第三，**late-stage drift 可能会减轻，但不会完全消失。**
+你现在已经发现后段减 `n_disc` 有帮助；fixed horizon 通常会让“后段策略靠 done 信息漂移”的成分变小，但判别器/生成器的博弈波动仍然存在。
+
+---
+
+## 最后给你一个最实用的执行顺序
+
+不要一次全改完直接跑 300 轮。
+最稳的顺序是：
+
+1. 加 `FIXED_HORIZON` 和 demo pad/clip
+2. 改 env 为 absorbing-tail fixed horizon
+3. 把 trainer 改成 `allow_variable_horizon=False`
+4. 先跑一个 **50 epoch 小 probe**
+5. 验证两件事：
+
+   * `len(set(len(traj.acts) for traj in expert_trajectories)) == 1`
+   * rollout 的 `ep_len_mean` 接近同一个固定 H
+6. 再跑 200/300 epoch 正式实验
+
+如果你愿意，我下一条可以直接按你这个 repo 的文件结构，给你整理成**可直接粘贴的 patch 版修改清单**。
+
+[1]: https://imitation.readthedocs.io/en/latest/_modules/imitation/algorithms/base.html "imitation.algorithms.base - imitation"
+[2]: https://github.com/xuejiali1234/gym-airl-copy/blob/main/envs/merging_env.py "gym-airl-copy/envs/merging_env.py at main · xuejiali1234/gym-airl-copy · GitHub"
+[3]: https://github.com/xuejiali1234/gym-airl-copy/blob/main/train_airl_baseline.py "gym-airl-copy/train_airl_baseline.py at main · xuejiali1234/gym-airl-copy · GitHub"
+[4]: https://imitation.readthedocs.io/en/latest/main-concepts/variable_horizon.html "Limitations on Horizon Length - imitation"

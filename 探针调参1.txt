@@ -1,0 +1,107 @@
+先说结论：**`PPO_EPOCHS=6` 现在应当保留为主线，但下一轮最该探的已经不是 `PPO_EPOCHS`，而是“判别器过快 + reward 尺度漂移 + 中期 critic 失稳”。** 你自己的 A–D probe 已经给出很清楚的方向：B 组（`PPO_EPOCHS=6, GENERATOR_LEARNING_RATE=8e-5`）在 100 轮的 best 和 final 都优于 `PPO_EPOCHS=8`，所以它应该当新的 control，而不是再把 8 当主线。 
+
+但你现在想要的“奖励曲线更像 RL”，和“训练性能更好”，在当前代码里其实是两个问题。`Policy_Return_Components_Norm100` 这张图，代码上就是把**稀疏环境奖励**拆成 `merge +0.5 / endpoint +0.5 / safety +1.0` 三项再缩放；环境 `step()` 里也确实只有首次并线、终点成功、安全成功这几次跳变。这个指标天然是 success-rate 风格的台阶曲线，**不可能靠调参变成 Atari/MuJoCo 那种 dense return 曲线**。([GitHub][1]) 
+
+你 repo 里的 `eval_dense_reward` 也没有真正“纯 dense”到足以自然长成经典 RL 曲线。环境里虽然加了 `p_goal`、`p_lane`、TTC、THW、jerk 这些逐步项，但它仍然保留了 merge/endpoint/safety/collision 的终止加减分；而你上传的离线 plotting 脚本更重，直接用了 `+20 / +20 / +40 / -40` 的 terminal bonus。结果就是：dense evaluator 只是**比稀疏环境回报稍微平滑一点**，但终止事件仍然主导总分，所以它也不会自动长成“低到高再收敛”的教科书式 RL 曲线。([GitHub][1]) 
+
+真正该调的是训练稳定性。当前仓库里，PPO 的 `n_epochs` 直接用 `cfg.PPO_EPOCHS`，`n_disc_updates_per_round` 仍硬编码为 `6`，`save_freq_epochs=20`、`eval_freq_epochs=1`、`quick_eval_episodes=8`、`full_eval_episodes=20`，而 AIRL trainer 仍然开着 `allow_variable_horizon=True`。同时，安全先验这条线实际上是 **frozen-only**，因为 `SAFETY_UNFREEZE_TIMESTEPS = EPOCHS * STEPS_PER_EPOCH + 1`，在 300×2048 这组设置下不会触发真正 unfreeze。([GitHub][2])
+
+从你上传的日志看，当前主矛盾也很明确：**中期判别器跑得比 PPO 快**。在大约 `6.35e4` 到 `8.19e4` timesteps 这段，`approx_kl` 已经掉到 `3.32e-05 ~ 4.94e-05`，`clip_fraction` 基本为 0，`explained_variance` 低到 `0.043 ~ 0.123`，但 `value_loss` 冲到 `799 ~ 1080+`；同时 `disc_reward_gap` 已经长到 `1.03 ~ 1.47`。这说明那一段 actor 几乎不怎么更新，critic 在追一个漂得很厉害的 reward 目标。好消息是后面它又恢复了：到 `3.52e5` 和 `5.9e5` 左右，`approx_kl` 回到 `0.007 / 0.0028`，`clip_fraction` 回到 `0.02 / 0.017`，`explained_variance` 到 `0.90 / 0.988`，`value_loss` 下到 `121 / 20`。所以它不是“完全学坏”，而是**中期失稳、后期回收**。  
+
+基于这组代码和日志，我给你的 probe 方向按优先级排是下面这几组。
+
+**第一优先级：在当前 B 组上只开 reward normalization。**
+也就是保留：
+
+* `PPO_EPOCHS = 6`
+* `GENERATOR_LEARNING_RATE = 8e-5`
+* `N_DISC_UPDATES = 6`
+* `GOAL_BONUS = 0.5`
+
+只改：
+
+* `ENABLE_REWARD_NORMALIZATION = True`
+
+原因很直接：你现在最明显的问题是 reward 标度在漂、critic 在爆，而 repo 里已经接好了 `NormalizedRewardNet(RunningNorm)` 开关。这个 probe 对训练目标改动最小，但最对症。([GitHub][3])
+
+**第二优先级：把判别器学习率降一档。**
+建议先试：
+
+* `DISCRIMINATOR_LEARNING_RATE: 5e-5 -> 4e-5`
+
+不动 PPO，不动 generator lr。
+理由是当前中期的病灶更像“判别器太快”，不是 generator 完全学不动。`disc_reward_gap` 中期已经能拉到 1 左右，但 PPO 的 `approx_kl` 和 `clip_fraction` 同时很低，这就是典型的 disc outrun generator。
+
+**第三优先级：把 `n_disc_updates_per_round` 从 6 试到 5。**
+不是 4。
+之前你自己的调参总结已经很明确：`disc=6` 仍然是主线最平衡选择，`disc=4` 已经可以基本排除，`disc=8` 更偏保守平滑但 final 不如 6。既然 6 是当前最好、4 太低，那现在最值得补的“中间点”就是 5。 
+
+**第四优先级：把 generator lr 稍微再降一档，作为 long-run fallback。**
+也就是试：
+
+* `GENERATOR_LEARNING_RATE: 8e-5 -> 7e-5`
+
+这组你其实已经在短程 probe 里试过，C 组整体很接近 B，只是 100 轮 final 稍逊，但它可能在 300 轮长跑里更稳。如果你的 300 轮 run 还是“200 epoch 后轻微回落”，那 `ppo6 + glr7e-5` 是自然的第二主线。
+
+**第五优先级：把 PPO minibatch 再放大一点。**
+建议只试一档：
+
+* `PPO_MINI_BATCH_SIZE: 256 -> 512`
+
+这个 probe 不是因为它一定提 final，而是因为你现在明显有 critic 方差问题。更大的 minibatch 往往能让 value update 稳一点。它的风险比改结构小，适合作为第四、第五轮补探。
+
+---
+
+我最推荐你下一轮直接按下面这个顺序跑，不要散着试：
+
+**Control**
+
+* `ppo6 / glr8e-5 / disc_lr5e-5 / n_disc6 / rnorm off`
+
+**Probe-1**
+
+* Control + `reward_norm on`
+
+**Probe-2**
+
+* Control + `disc_lr 4e-5`
+
+**Probe-3**
+
+* Control + `reward_norm on + disc_lr 4e-5`
+
+**Probe-4**
+
+* Control + `n_disc 5`
+
+**Probe-5**
+
+* `ppo6 / glr7e-5 / disc_lr5e-5 / n_disc6 / rnorm off`
+
+如果只允许先跑 3 组，我会选：**Control、Probe-1、Probe-3**。
+因为它们最直接对应你现在看到的中期塌陷。
+
+---
+
+还有两点很关键。
+
+第一，**不要再用“曲线像不像经典 RL reward”来挑 probe。**
+当前 repo 里，最稳的比较方法应该只看 full-eval 点，也就是 `epoch 0, 20, 40, ..., 300`。因为代码现在就是 `save_freq_epochs=20`，full eval 也是 20 episode；其余每个 epoch 的 quick eval 只有 8 episode，抖动一定很大。把 quick eval 和 full eval 混着看，会天然让你误判“模型不收敛”。([GitHub][2])
+
+第二，**现在别再动 `GOAL_BONUS`、安全分支结构、或者大模型结构。**
+`goal_bonus=0.5` 和 `disc=6` 在你已有实验里仍然是最平衡主线；安全分支这轮本来就一直 frozen，没有必要把“中期 PPO 失稳”误判成“安全模块结构不对”。 ([GitHub][3])
+
+如果你还关心“论文图怎么更像 RL”，那是**评估器重加权**的问题，不是训练 probe 的主方向。当前两条 return 曲线之所以都不像经典 RL，一条因为它本来是稀疏 success 组件图，另一条因为它的 dense evaluator 仍然被 terminal bonus 主导。这个问题，靠 `PPO_EPOCHS 6/8` 这种 probe 不会根治。真正能把图变得更顺的，是把 dense evaluator 里的终止 bonus 再缩小一档、把 step-wise progress/safety weights 再抬高一点，并且只画 full-eval 点的 EMA。
+
+你这轮最该做的，就是先把上面 5 组 probe 跑完，再只用 full-eval 点比：
+
+* `endpoint_success_rate`
+* `safety_success_rate`
+* `collision_rate`
+* `eval_ep_rew_mean`
+
+dense score 只当 tie-breaker，不当主裁判。
+
+[1]: https://github.com/xuejiali1234/gym-airl-copy/blob/main/envs/merging_env.py "gym-airl-copy/envs/merging_env.py at main · xuejiali1234/gym-airl-copy · GitHub"
+[2]: https://github.com/xuejiali1234/gym-airl-copy/blob/main/train_airl_baseline.py "gym-airl-copy/train_airl_baseline.py at main · xuejiali1234/gym-airl-copy · GitHub"
+[3]: https://github.com/xuejiali1234/gym-airl-copy/blob/main/configs/config.py "gym-airl-copy/configs/config.py at main · xuejiali1234/gym-airl-copy · GitHub"

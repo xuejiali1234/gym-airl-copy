@@ -117,7 +117,7 @@ def visualize_trajectory_batch():
     # 2. 加载模型
     # ---------------------------------------------------------
     try:
-        model_path = os.path.join(root_dir, "checkpoints", "baseline_policy_attn_goal_zero_branch_noaux_epoch_300.zip") 
+        model_path = os.path.join(root_dir, "checkpoints", "baseline_policy_attn_goal_safe_branch_aux_probe_P300_D5_S06_seed44_epoch_290.zip") 
         if not os.path.exists(model_path):
             print(f"❌ 找不到模型文件: {model_path}，请修改为正确的 zip 路径。")
             return

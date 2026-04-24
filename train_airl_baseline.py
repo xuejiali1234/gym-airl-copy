@@ -267,9 +267,16 @@ def apply_probe_overrides(cfg):
         overrides[attr_name] = value
 
     set_if_present("PROBE_EPOCHS", "EPOCHS", int)
+    set_if_present("PROBE_SEED", "SEED", int)
     set_if_present("PROBE_PPO_EPOCHS", "PPO_EPOCHS", int)
+    set_if_present("PROBE_PPO_MINI_BATCH_SIZE", "PPO_MINI_BATCH_SIZE", int)
     set_if_present("PROBE_GENERATOR_LR", "GENERATOR_LEARNING_RATE", float)
     set_if_present("PROBE_DISCRIMINATOR_LR", "DISCRIMINATOR_LEARNING_RATE", float)
+    set_if_present("PROBE_LATE_GEN_LR_EPOCH", "PROBE_LATE_GEN_LR_EPOCH", int)
+    set_if_present("PROBE_LATE_GEN_LR", "PROBE_LATE_GEN_LR", float)
+    set_if_present("PROBE_LATE_N_DISC_EPOCH", "PROBE_LATE_N_DISC_EPOCH", int)
+    set_if_present("PROBE_LATE_N_DISC_UPDATES", "PROBE_LATE_N_DISC_UPDATES", int)
+    set_if_present("PROBE_BEST_SELECT_START_EPOCH", "PROBE_BEST_SELECT_START_EPOCH", int)
     set_if_present("PROBE_SAFETY_REG_COEFF", "SAFETY_REGULATOR_COEFF", float)
     set_if_present("PROBE_ENT_COEF", "PPO_ENT_COEF", float)
     set_if_present("PROBE_SAVE_FREQ_EPOCHS", "PROBE_SAVE_FREQ_EPOCHS", int)
@@ -535,7 +542,8 @@ def main():
         seed=cfg.SEED,
     )
 
-    n_disc_updates_per_round = getattr(cfg, "PROBE_N_DISC_UPDATES", 6)
+    n_disc_updates_per_round = getattr(cfg, "PROBE_N_DISC_UPDATES", 5)
+    base_n_disc_updates = n_disc_updates_per_round
     trainer_kwargs = dict(
         demonstrations=expert_trajectories,
         demo_batch_size=256,
@@ -563,7 +571,7 @@ def main():
     # ==========================================
     # 4. 切块训练与定期保存 (Chunked Training)
     # ==========================================
-    save_freq_epochs = getattr(cfg, "PROBE_SAVE_FREQ_EPOCHS", 20)
+    save_freq_epochs = getattr(cfg, "PROBE_SAVE_FREQ_EPOCHS", 10)
     total_epochs = cfg.EPOCHS
     if total_epochs % save_freq_epochs != 0:
         raise ValueError(
@@ -573,9 +581,14 @@ def main():
     chunks = total_epochs // save_freq_epochs
     steps_per_chunk = save_freq_epochs * cfg.STEPS_PER_EPOCH
     base_gen_lr = cfg.GENERATOR_LEARNING_RATE
+    late_gen_lr_epoch = getattr(cfg, "PROBE_LATE_GEN_LR_EPOCH", None)
+    late_gen_lr = getattr(cfg, "PROBE_LATE_GEN_LR", None)
+    late_n_disc_epoch = getattr(cfg, "PROBE_LATE_N_DISC_EPOCH", None)
+    late_n_disc_updates = getattr(cfg, "PROBE_LATE_N_DISC_UPDATES", None)
+    best_select_start_epoch = getattr(cfg, "PROBE_BEST_SELECT_START_EPOCH", 0)
     eval_freq_epochs = 1
     quick_eval_episodes = getattr(cfg, "PROBE_QUICK_EVAL_EPISODES", 8)
-    full_eval_episodes = getattr(cfg, "PROBE_FULL_EVAL_EPISODES", 20)
+    full_eval_episodes = getattr(cfg, "PROBE_FULL_EVAL_EPISODES", 40)
     n_eval_episodes = full_eval_episodes
     safety_unfreeze_timesteps = getattr(cfg, "SAFETY_UNFREEZE_TIMESTEPS", 100000)
     safety_light_unfreeze_lr = getattr(cfg, "SAFETY_LIGHT_UNFREEZE_LR", 1e-5)
@@ -597,10 +610,16 @@ def main():
                 "seed": cfg.SEED,
                 "deterministic_training": deterministic_training,
                 "n_disc_updates_per_round": n_disc_updates_per_round,
+                "ppo_mini_batch_size": cfg.PPO_MINI_BATCH_SIZE,
                 "ppo_epochs": cfg.PPO_EPOCHS,
                 "ppo_ent_coef": getattr(cfg, "PPO_ENT_COEF", 0.005),
                 "generator_learning_rate": cfg.GENERATOR_LEARNING_RATE,
                 "discriminator_learning_rate": cfg.DISCRIMINATOR_LEARNING_RATE,
+                "late_gen_lr_epoch": late_gen_lr_epoch,
+                "late_gen_lr": late_gen_lr,
+                "late_n_disc_epoch": late_n_disc_epoch,
+                "late_n_disc_updates": late_n_disc_updates,
+                "best_select_start_epoch": best_select_start_epoch,
                 "save_freq_epochs": save_freq_epochs,
                 "eval_freq_epochs": eval_freq_epochs,
                 "quick_eval_episodes": quick_eval_episodes,
@@ -672,12 +691,33 @@ def main():
         f"collision={epoch0_metrics['collision_rate']:.3f}"
     )
 
+    def build_best_key(metrics):
+        return (
+            float(metrics.get("eval_ep_rew_mean", float("-inf"))),
+            float(metrics.get("safety_success_rate", float("-inf"))),
+            -float(metrics.get("collision_rate", float("inf"))),
+            float(metrics.get("merge_success_rate", float("-inf"))),
+            float(metrics.get("endpoint_success_rate", float("-inf"))),
+        )
+
+    best_checkpoint_key = None
+    best_checkpoint_epoch = None
+    best_checkpoint_path = None
+
     for chunk in range(chunks):
         # ==========================================
         # 手动实现两阶段学习率退火
         # ==========================================
+        chunk_start_epoch = chunk * save_freq_epochs + 1
         current_lr = base_gen_lr
+        if late_gen_lr_epoch is not None and late_gen_lr is not None and chunk_start_epoch > late_gen_lr_epoch:
+            current_lr = late_gen_lr
         learner.lr_schedule = lambda _: current_lr
+        current_n_disc_updates = base_n_disc_updates
+        if late_n_disc_epoch is not None and late_n_disc_updates is not None and chunk_start_epoch > late_n_disc_epoch:
+            current_n_disc_updates = late_n_disc_updates
+        if hasattr(airl_trainer, "n_disc_updates_per_round"):
+            airl_trainer.n_disc_updates_per_round = current_n_disc_updates
         if (
             enable_safety
             and hasattr(base_reward_net, "set_safety_training_phase")
@@ -734,6 +774,17 @@ def main():
         checkpoint_path = os.path.join(checkpoint_dir, f"baseline_policy_{run_label}_epoch_{current_epoch}.zip")
         learner.save(checkpoint_path)
         eval_metrics = last_eval_metrics
+        if current_epoch >= best_select_start_epoch:
+            current_best_key = build_best_key(eval_metrics)
+            if best_checkpoint_key is None or current_best_key > best_checkpoint_key:
+                best_checkpoint_key = current_best_key
+                best_checkpoint_epoch = current_epoch
+                best_checkpoint_path = os.path.join(
+                    checkpoint_dir,
+                    f"baseline_policy_{run_label}_best_epoch_{current_epoch}.zip",
+                )
+                learner.save(best_checkpoint_path)
+                print(f"[*] Best checkpoint updated -> {best_checkpoint_path}")
 
         print(
             f"[*] 进度 {current_epoch}/{total_epochs} Epochs -> 模型已保存至: {checkpoint_path}"
@@ -752,7 +803,8 @@ def main():
             f"eval_ep_rew={eval_metrics['eval_ep_rew_mean']:.3f}, "
             f"dense_norm100={eval_metrics['eval_dense_return_norm100']:.2f}, "
             f"paper_rank={eval_metrics['paper_rank_score_mean']:.2f}, "
-            f"lr={current_lr:.6f}"
+            f"lr={current_lr:.6f}, "
+            f"n_disc={current_n_disc_updates}"
         )
 
     # ==========================================
@@ -761,6 +813,9 @@ def main():
     final_checkpoint_path = os.path.join(checkpoint_dir, f"airl_policy_baseline_{run_label}_final.zip")
     learner.save(final_checkpoint_path)
     print(f"\n训练全部完成，最终策略已保存为 {final_checkpoint_path}。")
+
+    if best_checkpoint_path is not None:
+        print(f"[*] Best checkpoint in selection window: epoch={best_checkpoint_epoch}, path={best_checkpoint_path}")
 
 if __name__ == "__main__":
     main()

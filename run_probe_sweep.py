@@ -10,69 +10,71 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent
 
 BASE_ENV = {
-    "PROBE_EPOCHS": "100",
-    "PROBE_SAVE_FREQ_EPOCHS": "10",
-    "PROBE_QUICK_EVAL_EPISODES": "4",
-    "PROBE_FULL_EVAL_EPISODES": "10",
+    "PROBE_EPOCHS": "300",
+    "PROBE_SAVE_FREQ_EPOCHS": "5",
+    "PROBE_QUICK_EVAL_EPISODES": "8",
+    "PROBE_FULL_EVAL_EPISODES": "40",
+    "PROBE_REWARD_NORM": "0",
+    "PROBE_BEST_SELECT_START_EPOCH": "260",
+}
+
+CONTROL_ENV = {
+    "PROBE_PPO_EPOCHS": "6",
+    "PROBE_PPO_MINI_BATCH_SIZE": "256",
+    "PROBE_GENERATOR_LR": "8e-5",
+    "PROBE_DISCRIMINATOR_LR": "5e-5",
+    "PROBE_SAFETY_REG_COEFF": "0.06",
+    "PROBE_N_DISC_UPDATES": "5",
+    "PROBE_ENT_COEF": "0.005",
     "PROBE_REWARD_NORM": "0",
 }
 
 EXPERIMENTS = [
     {
-        "name": "A_base_ppo8_glr8e5",
-        "description": "Current short baseline: PPO_EPOCHS=8, generator_lr=8e-5.",
+        "name": "P300_S06_LateD4_s43",
+        "description": "LateD4 replicate with seed 43: after epoch 240, n_disc_updates_per_round drops from 5 to 4.",
         "env": {
-            "PROBE_PPO_EPOCHS": "8",
-            "PROBE_GENERATOR_LR": "8e-5",
+            "PROBE_SEED": "43",
+            "PROBE_LATE_N_DISC_EPOCH": "240",
+            "PROBE_LATE_N_DISC_UPDATES": "4",
         },
     },
     {
-        "name": "B_ppo6_glr8e5",
-        "description": "Lower PPO epochs to test more stable generator updates.",
+        "name": "P300_S06_LateD4_s42",
+        "description": "LateD4 replicate with seed 42: after epoch 240, n_disc_updates_per_round drops from 5 to 4.",
         "env": {
-            "PROBE_PPO_EPOCHS": "6",
-            "PROBE_GENERATOR_LR": "8e-5",
+            "PROBE_SEED": "42",
+            "PROBE_LATE_N_DISC_EPOCH": "240",
+            "PROBE_LATE_N_DISC_UPDATES": "4",
         },
     },
     {
-        "name": "C_ppo6_glr7e5",
-        "description": "Lower PPO epochs and generator learning rate.",
+        "name": "P300_S06_LateD4_e230",
+        "description": "LateD4 timing probe on seed 44: after epoch 230, n_disc_updates_per_round drops from 5 to 4.",
         "env": {
-            "PROBE_PPO_EPOCHS": "6",
-            "PROBE_GENERATOR_LR": "7e-5",
+            "PROBE_SEED": "44",
+            "PROBE_LATE_N_DISC_EPOCH": "230",
+            "PROBE_LATE_N_DISC_UPDATES": "4",
         },
     },
     {
-        "name": "D_ppo8_glr7e5",
-        "description": "Keep PPO epochs, lower generator learning rate.",
+        "name": "P300_S06_LateD4_e250",
+        "description": "LateD4 timing probe on seed 44: after epoch 250, n_disc_updates_per_round drops from 5 to 4.",
         "env": {
-            "PROBE_PPO_EPOCHS": "8",
-            "PROBE_GENERATOR_LR": "7e-5",
-        },
-    },
-    {
-        "name": "E_ppo6_glr7e5_rnorm",
-        "description": "Probe C plus reward normalization.",
-        "env": {
-            "PROBE_PPO_EPOCHS": "6",
-            "PROBE_GENERATOR_LR": "7e-5",
-            "PROBE_REWARD_NORM": "1",
+            "PROBE_SEED": "44",
+            "PROBE_LATE_N_DISC_EPOCH": "250",
+            "PROBE_LATE_N_DISC_UPDATES": "4",
         },
     },
 ]
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run short AIRL probe sweeps sequentially.")
-    parser.add_argument(
-        "--include-rnorm",
-        action="store_true",
-        help="Also run experiment E with reward normalization.",
-    )
+    parser = argparse.ArgumentParser(description="Run late-stage AIRL schedule probes sequentially.")
     parser.add_argument(
         "--only",
         default="",
-        help="Comma-separated experiment prefixes/names to run, e.g. A,B or C_ppo6_glr7e5.",
+        help="Comma-separated experiment prefixes/names to run.",
     )
     parser.add_argument(
         "--dry-run",
@@ -83,7 +85,7 @@ def parse_args():
 
 
 def selected_experiments(args):
-    experiments = EXPERIMENTS if args.include_rnorm else [exp for exp in EXPERIMENTS if not exp["name"].startswith("E_")]
+    experiments = EXPERIMENTS
     if not args.only:
         return experiments
 
@@ -100,6 +102,7 @@ def selected_experiments(args):
 def build_env(exp):
     env = os.environ.copy()
     overrides = dict(BASE_ENV)
+    overrides.update(CONTROL_ENV)
     overrides.update(exp["env"])
     overrides["PROBE_TAG"] = exp["name"]
     env.update(overrides)

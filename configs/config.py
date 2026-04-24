@@ -29,7 +29,7 @@ class Config:
     X_MAX = 72
 
     # [新增] PPO 训练参数
-    PPO_EPOCHS = 8
+    PPO_EPOCHS = 6
     PPO_MINI_BATCH_SIZE = 256
 
     # [新增] Ranking Loss 的 Margin 建议设为 0.1 到 0.5 之间。
@@ -45,7 +45,7 @@ class Config:
 
     # --- 训练参数 ---
     DEVICE = "cuda"
-    SEED = 42
+    SEED = 44
     DETERMINISTIC_TRAINING = True
     EPOCHS = 300
     STEPS_PER_EPOCH = 2048

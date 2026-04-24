@@ -1,0 +1,121 @@
+这轮 probe 之后，主线其实已经很清楚了：
+
+`n_disc=5` 已经赢过 `n_disc=6`，而且安全正则的有效区间已经收缩到 **0.06–0.07**。最新结果里，`P300_D5_S06` 在 **epoch 280** 达到这轮最强峰值：`merge=0.80, endpoint=1.00, safety=0.90, collision=0.10, env_return=1.800, dense=40.55`；`P300_D5_S07` 则在 **epoch 300** 给出更稳的最终点：`merge=0.75, endpoint=1.00, safety=0.85, collision=0.15, env_return=1.725, dense=40.71`。相反，`P300_D6_S07` 到 300 轮已经明显崩掉，不值得再沿着 `n_disc=6` 继续扫了。 
+
+再结合上一轮 `D5_S08 / S09 / S10` 的 300 轮结果看，`sreg` 往 `0.08, 0.09, 0.10` 推并没有带来更好的长期结果；`0.08` 只是那一组里最好，但仍落后于现在的 `D5_S06 / D5_S07`。所以当前真正的 sweet spot 不是 `0.08+`，而是已经缩到 **`D5 + sreg 0.06~0.07`**。 
+
+所以，下一步我不建议再做“大范围横向探针”了。现在最值钱的不是再试更多 `sreg`，而是回答两个更关键的问题：
+
+第一，`D5_S06` 的强峰值是不是稳定可复现。
+第二，`D5_S07` 的“最终更稳”是不是只是 20 条 full-eval 评估下的采样优势。
+
+这里有个很重要的点：你当前 probe manifest 里 full eval 仍然是 **20 个 episode**，而训练脚本也是按 `save_freq_epochs` 做 full eval / 保存。20 个 episode 意味着成功率的最小步长就是 `0.05`，所以 `safety 0.90 vs 0.85`、`collision 0.10 vs 0.15` 本质上都只是 **1 个 episode** 的差别。也就是说，现在继续扫超参的收益，已经低于做**多 seed 复验**的收益了。 ([GitHub][1])
+
+我建议下一步分成两层。
+
+## 第一层：先做复验，不再散扫
+
+先把主线锁成下面这组，不再动：
+
+```python
+PPO_EPOCHS = 6
+GENERATOR_LEARNING_RATE = 8e-5
+DISCRIMINATOR_LEARNING_RATE = 5e-5
+N_DISC_UPDATES = 5
+SAFETY_REGULATOR_COEFF ∈ {0.06, 0.07}
+ENT_COEF = 0.005
+REWARD_NORM = False
+```
+
+这不是拍脑袋，是三轮 probe 一起收敛出来的主线：100 轮时 `ppo6 + glr8e-5` 最优；200 轮时 `D5` 是唯一明显有价值的新方向；300 轮时 `D5_S06 / D5_S07` 明确优于 `D5_S08+`，而 `D6_S07` 彻底掉队。  
+
+然后不要先加新超参，先跑 **2×2 个复验**：
+
+`D5_S06_seed43`
+`D5_S06_seed44`
+`D5_S07_seed43`
+`D5_S07_seed44`
+
+每组都用：
+
+```python
+PROBE_EPOCHS=300
+PROBE_SAVE_FREQ_EPOCHS=10
+PROBE_QUICK_EVAL_EPISODES=8
+PROBE_FULL_EVAL_EPISODES=40
+PROBE_PPO_EPOCHS=6
+PROBE_GENERATOR_LR=8e-5
+PROBE_DISCRIMINATOR_LR=5e-5
+PROBE_N_DISC_UPDATES=5
+PROBE_ENT_COEF=0.005
+PROBE_REWARD_NORM=0
+```
+
+`D5_S06` 用 `PROBE_SAFETY_REG_COEFF=0.06`，`D5_S07` 用 `0.07`。
+
+这里我把 `save_freq_epochs` 从 20 改到 10，不是为了改训练，而是为了**更细地抓 best checkpoint**。你现在 `D5_S06` 的问题不是“学不会”，而是 **280 强、300 回落**；继续 20 轮一个 checkpoint，可能会错过更好的 270/290 一带点。代码本身已经支持 `PROBE_SAVE_FREQ_EPOCHS`、`PROBE_FULL_EVAL_EPISODES` 这类 probe override，所以这一步不需要改训练逻辑。([GitHub][1])
+
+## 第二层：只加一个新旋钮，优先试 mini-batch
+
+如果你复验之后仍然发现：
+
+* `D5_S06` 还是容易后期回落；
+* `D5_S07` 虽稳但峰值总差一点；
+
+那下一步最值得加的**唯一新旋钮**，不是再动 `sreg`，而是 **PPO mini-batch size**。
+
+原因是你之前 `ppo6` 主线日志里，中段多次出现了很典型的模式：`approx_kl` 已经掉到 `3e-5 ~ 5e-5`，`clip_fraction≈0`，但 `value_loss` 却冲到 `799 ~ 1080`；这说明 actor 基本不怎么动，critic 在追一个很不稳的目标。这个现象更像是 **PPO/critic 方差问题**，不太像“安全权重还没调到位”。
+
+而当前代码里，PPO 已经是用 `cfg.PPO_MINI_BATCH_SIZE` 作为 `batch_size`，但 `apply_probe_overrides()` 里还没有对应的 `PROBE_PPO_MINI_BATCH_SIZE` 开关；也就是说，这个旋钮目前**代码支持底层参数，但 probe 入口没暴露**。`apply_probe_overrides()` 现在支持的是 `PPO_EPOCHS / GENERATOR_LR / DISCRIMINATOR_LR / SAFETY_REG_COEFF / ENT_COEF / SAVE_FREQ / EVAL_EPISODES / N_DISC_UPDATES / REWARD_NORM`，而 PPO 实例化处确实单独读取了 `cfg.PPO_MINI_BATCH_SIZE`。([GitHub][1])
+
+所以我建议你先补两行：
+
+```python
+# train_airl_baseline.py -> apply_probe_overrides(cfg)
+set_if_present("PROBE_PPO_MINI_BATCH_SIZE", "PPO_MINI_BATCH_SIZE", int)
+set_if_present("PROBE_SEED", "SEED", int)
+```
+
+当前代码里 `seed_everything(cfg.SEED, ...)` 已经固定按 `cfg.SEED` 走，但 override 列表里也还没有 `PROBE_SEED`，所以你现在做 seed 复验也不够方便。([GitHub][1])
+
+补完以后，第三阶段只跑两组就够：
+
+```python
+D5_S06_B512:
+  seed=42
+  batch_size=512
+  其他参数保持 D5_S06 不变
+
+D5_S07_B512:
+  seed=42
+  batch_size=512
+  其他参数保持 D5_S07 不变
+```
+
+我会优先押 `D5_S06_B512`，因为你现在最想解决的是“峰值强但后面掉”，而不是“最终点不够稳”。
+
+## 现在可以停掉的方向
+
+这几个方向，我建议先全部停掉：
+
+* `n_disc=6`
+* `sreg >= 0.08`
+* `reward normalization`
+* `disc_lr = 4e-5`
+* `glr = 7e-5`
+* `ent = 0.003`
+
+前几轮 probe 已经给足证据了：这些方向要么没有超过主线，要么会把策略推向更保守但不更强，或者长期更差。  
+
+## 我建议你现在就这么做
+
+先锁主线：`D5 + sreg 0.06~0.07`。
+先做四个复验：`D5_S06 / D5_S07 × seed43/44`。
+把 `save_freq_epochs` 改成 10，`full_eval_episodes` 改成 40。
+复验后，如果 `D5_S06` 仍然 280 好、300 掉，就加 `PROBE_PPO_MINI_BATCH_SIZE`，只测 `512` 这一档。
+
+一句话总结：
+
+**下一步不是再找新的大方向，而是先验证 `D5_S06` 和 `D5_S07` 哪条线更可复现；真正值得新增的超参旋钮，只剩 mini-batch size。**
+
+[1]: https://github.com/xuejiali1234/gym-airl-copy/blob/main/train_airl_baseline.py "gym-airl-copy/train_airl_baseline.py at main · xuejiali1234/gym-airl-copy · GitHub"

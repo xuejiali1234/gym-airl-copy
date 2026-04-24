@@ -1,0 +1,62 @@
+According to a document from (2026-04-20)，`D5_S06_seed44 @ epoch 290` **是比你最开始那条基线略强的**，但不是“明显拉开一档”的强。你这轮复验里它在 `epoch 290` 的 full-eval 指标是 `merge=0.95, endpoint=1.00, safety=0.875, collision=0.125, env_return=1.85, dense=42.37`；而你之前两条强基线大致是 `20260418_180202 @240: env=1.775, merge=0.75, safety=0.90, collision=0.10`，以及 `20260418_224355 @280: env=1.80, merge=0.90, safety=0.85, collision=0.15`。所以严格说，新模型在 **merge、env_return、dense** 上略占优，安全和碰撞基本同档，但提升幅度确实不大，属于“边际更强”，不是“肉眼非常明显”的飞跃。 
+
+你会觉得“可视化上没强多少”，这也是正常的。你当前 `Policy_Return_Components_Norm100` 的脚本是把环境奖励预算 `0.5 + 0.5 + 1.0 = 2.0` 线性缩放到 100 分，所以 **环境回报每增加 0.05，图上只增加 2.5 分**；而 full-eval 用的是 40 条轨迹时，成功率本身又是离散跳变的，视觉上本来就不容易拉开很大差距。也就是说，这张图天然更适合看“趋势”和“构成”，不适合期待出现经典 RL 那种巨大分差。
+
+你这轮真正的问题，不是“290 不够强”，而是 **290 之后发生了后期漂移**。我直接看了你刚上传的 `eval_metrics(6).csv`：
+`epoch 290` 是 `merge=0.95 / endpoint=1.00 / safety=0.875 / collision=0.125 / env=1.85`；
+但到 `epoch 300` 变成 `merge=0.10 / endpoint=0.55 / safety=0.50 / collision=0.05 / env=0.825`。
+这说明后期掉下去的主因不是“撞得更多”，而是 **策略变得过于保守，不敢并线了**：collision 反而更低，`min_ttc` 还升高了，但 merge 和 endpoint 明显塌掉。
+
+再看你上传的 `progress(7).csv`，`295–300` 附近并不是 PPO 完全不动；相反，`approx_kl` 和 `clip_fraction` 还是有量的，尤其 297–300 一带还在继续更新。这说明后期问题更像是：**模型在已经学到好策略之后，还在继续被对抗目标推着走，最终漂到“更安全但更不愿意完成并线”的局部最优**。不是典型的“value_loss 爆炸然后全盘崩”，而是“late-stage policy drift”。
+
+所以我的判断是：
+
+**先不要大范围重扫静态超参。**
+你现在这条主线已经基本找对了：`PPO_EPOCHS=6, GEN_LR=8e-5, N_DISC=5, SREG=0.06, batch=256`。前面的 probe 也已经说明，`B512` 会更差，`S07` 作为主线不够稳，`n_disc=6` 后期更容易偏。 
+
+更合适的做法是两步：
+
+第一步，**把正式模型选择改成 best checkpoint，而不是 final checkpoint**。
+对你现在这条线，直接把 `285–295` 作为重点窗口；按当前数据，`290` 已经很好，实际上 quick-eval 的 `291/293` 还更高，但不和 full-eval 同口径，所以论文和主结果还是优先拿 `290` 这个 full-eval checkpoint。
+
+第二步，**做 late-stage schedule probe，而不是全程改参**。
+因为你的问题发生在“已经学会之后的最后 10% 训练”，所以应该改“后段更新节奏”，不是重做前段学习。
+
+我建议下一轮只跑 2 个 probe：
+
+`Probe-A：late LR decay`
+保持当前主线不变，只在 `epoch 240` 之后把 `GENERATOR_LEARNING_RATE` 从 `8e-5` 降到 `4e-5`。
+这是我最优先推荐的，因为你后期是“还在继续更新并漂走”，那先减小后段步长最对症。
+
+`Probe-B：late discriminator slowdown`
+保持当前主线不变，只在 `epoch 240` 之后把 `N_DISC_UPDATES` 从 `5` 降到 `4`。
+不是全程用 4，而是只在后段降，用来减少 reward 漂移。
+
+如果你还能多跑一个，再加：
+
+`Probe-C：late entropy decay`
+`PPO_ENT_COEF` 在 `epoch 240` 后从 `0.005` 降到 `0.001`。
+这不是为了解决前期探索，而是为了减少后段策略继续乱飘。
+
+我不建议你现在去试这些方向：
+
+* `PPO_MINI_BATCH_SIZE = 512`
+* `sreg >= 0.07`
+* `reward normalization`
+* 回到 `n_disc = 6`
+
+这些方向你前面的 probe 已经基本证明不是主线。
+
+我会把下一轮执行方案定成这样：
+
+1. 固定主线：`ppo6 / glr8e-5 / dlr5e-5 / n_disc5 / sreg0.06 / batch256 / ent0.005`
+2. `save_freq_epochs = 5`
+3. `full_eval_episodes = 40`
+4. 只跑 `Probe-A` 和 `Probe-B`
+5. 选模只看 `epoch 260–300` 的 full-eval 点
+6. 默认保存 best checkpoint，不再默认 final
+
+如果你现在的目标是“拿最强模型做论文结果”，我会直接建议：
+
+**先用 `D5_S06_seed44 @ epoch 290` 作为当前主模型。**
+如果你的目标是“让 300 轮末端也别掉”，那下一步不是大改参，而是做我上面那两个 **late-stage schedule** 探针。

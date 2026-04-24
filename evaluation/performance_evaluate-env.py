@@ -68,7 +68,7 @@ class MetricsEvaluator:
 
         # 2. 加载 SB3 PPO 模型
         # 请根据实际情况确认你的 .zip 模型名称
-        model_path = os.path.join(root_dir, "checkpoints", "baseline_policy_attn_epoch_240.zip")
+        model_path = os.path.join(root_dir, "checkpoints", "baseline_policy_attn_goal_safe_branch_aux_probe_P300_D5_S06_seed44_epoch_290.zip")
         if not os.path.exists(model_path):
             print(f"❌ 未找到模型: {model_path}")
             sys.exit(1)

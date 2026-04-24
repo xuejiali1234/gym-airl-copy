@@ -1,0 +1,76 @@
+我把两轮 probe 合起来看，结论很清楚：现在不该再做“单点散扫”，而该做**两条有效方向的交互验证**。
+
+第一轮 200 轮 probe 证明了一个稳定趋势：在 `ppo6 + glr=8e-5` 主线上，把 `SAFETY_REGULATOR_COEFF` 从 `0.06 -> 0.08 -> 0.10` 往上推，best full-eval 的环境回报从 `1.25 -> 1.30 -> 1.40`，安全率从 `0.45 -> 0.50 -> 0.55`，碰撞率从 `0.55 -> 0.50 -> 0.45`，说明 **`safety_reg` 是真有效轴**；反过来，`ent=0.003` 的 `P200_E` 虽然把安全率推到 `0.75`、碰撞率压到 `0.25`，但 `merge` 掉到 `0.25`，明显过保守；`glr=7e-5` 的 `P200_D` 到 200 轮也直接塌掉，所以“降熵”和“直接降 generator lr”都不该继续做主线。 
+
+第二轮 200 轮 probe 证明了另一个独立有效方向：在 control 基线上，只有 `P200_D5`，也就是把 `n_disc_updates_per_round` 从 `6` 降到 `5`，是明显值得继续的。它在 160 轮达到 `endpoint=0.95 / safety=0.65 / collision=0.35 / env_return=1.40 / dense=37.07 / jerk=0.61`，而且你自己的总结里也明确写了：`D5` 的对抗平衡更健康，`reward_gap` 更小、`value_loss` 更低；相反，`reward normalization`、`disc_lr=4e-5`、`glr=7e-5` 都没有带来正收益。 
+
+把这两轮放在一起，最有价值的信息其实是这一句：
+
+**`P200_C` 和 `P200_D5` 分别在“安全辅助权重”和“对抗平衡”两个轴上赢了，但你从来没有把这两个有效方向组合起来测过。**
+
+更具体地说，`P200_C` 的 best 点是 `merge=0.70 / endpoint=1.00 / safety=0.55 / collision=0.45 / env_return=1.40`；`P200_D5` 的 best 点是 `merge=0.55 / endpoint=0.95 / safety=0.65 / collision=0.35 / env_return=1.40`。一个更会“完成合流”，一个更安全更平滑，环境回报都到 `1.40`。所以**下一轮最该探的是 `D5 × safety_reg` 的交互项**，而不是继续回头试 `reward_norm`、`disc_lr=4e-5` 或 `glr=7e-5`。 
+
+你的当前代码也正好支持这样做。训练脚本已经暴露了 `PROBE_SAFETY_REG_COEFF`、`PROBE_N_DISC_UPDATES`、`PROBE_ENT_COEF`、`PROBE_REWARD_NORM` 等环境变量 override；PPO 里实际用的是 `n_epochs=cfg.PPO_EPOCHS`、`batch_size=cfg.PPO_MINI_BATCH_SIZE`、`ent_coef=getattr(cfg, "PPO_ENT_COEF", 0.005)`，而 AIRL trainer 仍然是 `allow_variable_horizon=True`。所以这轮交互 sweep 你**不需要改主代码逻辑**，直接沿用现在的 probe 入口即可。([GitHub][1])
+
+我建议下一轮先只跑 **3 组 200 轮**，别再一下子开 6 组。
+
+第一组，`D5_S08`
+`PPO_EPOCHS=6, GENERATOR_LR=8e-5, DISCRIMINATOR_LR=5e-5, N_DISC_UPDATES=5, SAFETY_REGULATOR_COEFF=0.08, ENT_COEF=0.005, REWARD_NORM=False`
+
+第二组，`D5_S09`
+和上面完全一样，只把 `SAFETY_REGULATOR_COEFF=0.09`
+
+第三组，`D5_S10`
+和上面完全一样，只把 `SAFETY_REGULATOR_COEFF=0.10`
+
+为什么是这三组，不是别的？
+因为你已经知道：
+
+* `0.06` 在 `D5` 下能把安全提上去，但 merge 偏低。
+* `0.10` 在 `disc=6` 下是第一轮最好的安全辅助权重点。
+* 中间的 `0.08/0.09` 恰恰是现在**信息增益最大**、但还没和 `D5` 组合测过的区间。
+
+如果你这轮算力只够跑 **1 组**，那就先跑：
+
+`ppo6 + glr=8e-5 + disc_lr=5e-5 + n_disc=5 + safety_reg=0.09 + ent=0.005 + rnorm=off`
+
+这组是我认为**最值得下注的单点**，因为它正好落在 `P200_C` 和 `P200_D5` 的中间。
+
+这轮 probe 的判定标准，也建议你改一下。不要再拿“奖励曲线像不像经典 RL 曲线”做主标准。你现在 repo 里的 `Policy_Return_Components_Norm100` 脚本，本质就是把环境奖励预算 `0.5 + 0.5 + 1.0` 线性缩放，再拆成 `merge / endpoint / safety` 三项；而 dense-eval 脚本又是另一套自定义 dense score，加了终止 bonus 再做 baseline 归一化。它们都不是“纯 PPO return”，所以**不适合拿曲线形状挑模型**。 
+
+这轮我建议你只按 **full-eval 点** 选模型，也就是每 20 轮一次、20 条轨迹那组点。主分数直接用：
+
+[
+score = env_return + 0.5 \cdot merge + 0.5 \cdot safety - 0.5 \cdot collision - 0.05 \cdot jerk
+]
+
+然后只看 best checkpoint，不看 final checkpoint。
+按这个口径，下一轮的目标不是“曲线更像 RL”，而是明确超过你现在两条有效主线：
+
+* 至少要比 `P200_C` 的 `merge=0.70 / endpoint=1.00 / safety=0.55 / collision=0.45 / env=1.40` 更均衡。
+* 至少要保住 `P200_D5` 的 `safety=0.65 / collision=0.35 / jerk=0.61` 这一侧优势。
+
+也就是说，我会把下一轮的“过线标准”定成：
+
+* `best_env_return > 1.40`
+* `merge >= 0.60`
+* `safety >= 0.60`
+* `collision <= 0.35`
+* `jerk <= 0.90`
+
+这组标准一旦有任何一组 probe 达到，就值得直接拉到 300 轮正式验证。
+
+如果这 3 组里，最佳模型仍然出现“160 轮最好、到 200 轮又掉下去”的情况，再开 **第二阶段 2 组小修正**，但不要现在就跑：
+
+* `best_stage1 + glr=7.5e-5`
+* `best_stage1 + ent=0.006`
+
+这里我故意不用 `7e-5` 和 `0.003`，因为你已经验证过：`7e-5` 单独下调太猛，`0.003` 会把策略推得太保守。下一步该试的是**小幅修正**，不是再走已经证明会坏掉的极端值。 
+
+再往后一步，如果 `D5 × sreg` 这轮还是不能把“中期最好、后面回落”压平，那下一把就不该继续扫 `reward_norm` 了，而是应该补一个**代码层面的 probe 入口**：把 `PROBE_PPO_MINI_BATCH_SIZE` 也暴露出来。因为当前代码里 PPO 实际已经在用 `batch_size=cfg.PPO_MINI_BATCH_SIZE`，但 override helper 还没有对应的 probe 开关；而从你之前日志里反复出现的 `value_loss` 抬高、critic 压力偏大来看，`mini_batch_size: 256 -> 512` 会是下一个真正有意义的稳定性旋钮。([GitHub][1])
+
+我给你的最终建议就一句话：
+
+**下一轮不要再横向散扫了，直接做 `n_disc=5 × safety_reg(0.08/0.09/0.10)` 的 3 组交互 probe；若还存在 160 最优、200 回落，再只补 `glr=7.5e-5` 或 `ent=0.006` 这两种微调。**
+
+[1]: https://github.com/xuejiali1234/gym-airl-copy/blob/main/train_airl_baseline.py "gym-airl-copy/train_airl_baseline.py at main · xuejiali1234/gym-airl-copy · GitHub"

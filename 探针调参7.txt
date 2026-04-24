@@ -1,0 +1,128 @@
+According to a document from (2026-04-21)，这轮探针最重要的结论已经比较稳定了：**LateD4 有效，LateLR 基本无效，B512 可以停掉。** 具体看结果，`LateLR` 在 230 轮曾达到 `merge=0.875 / endpoint=0.925 / safety=0.825 / collision=0.125 / env_return=1.725 / dense=42.40`，但到 300 轮掉成 `merge=0.075 / endpoint=0.625 / safety=0.575 / collision=0.050 / env_return=0.925 / dense=31.72`；而 `LateD4` 跑满 300 轮时还能保持 `merge=0.900 / endpoint=1.000 / safety=0.875 / collision=0.125 / env_return=1.825 / dense=41.95`。如果只看**历史最高单点**，仍然是旧的 `D5_S06_seed44 @ epoch 290`，它有 `merge=0.95 / endpoint=1.00 / safety=0.875 / collision=0.125 / env_return=1.85 / dense=42.37`，略高于 `LateD4 @300`，但差距已经不大。 
+
+这轮日志也把“为什么”讲清楚了。`LateD4` 和 `LateLR` 的基础配置其实相同，差别只在 **240 轮后的后段调度**：`LateD4` 是把 `n_disc_updates_per_round` 从 `5` 降到 `4`，而 `LateLR` 是把 `generator lr` 从 `8e-5` 降到 `4e-5`。也就是说，这两个 probe 真正测试的是“减小判别器推进速度” versus “减小生成器步长”。 
+
+从训练状态看，`LateLR` 的问题不是“没出过好点”，而是**后段仍然被对抗目标带偏**。在 290 轮时它看上去还不错，但训练内部已经表现为 `approx_kl=0.00193`、`clip_fraction=0.000488`、`value_loss=124`、`disc_reward_gap=0.112`，说明 actor 更新已经很弱了，critic 还在追 reward 目标；这个时候单纯把生成器学习率减半，只会让 actor 更慢，并不能真正压住后期漂移，所以最后还是塌了。
+
+`LateD4` 则不一样。它在 240 轮后直接减少判别器更新次数，等于**从源头减小 reward 漂移速度**。详细日志里，245 轮刚切过去以后，模型已经能做到 `safety=0.825 / collision=0.050 / env_return=1.525`，同时训练侧还是活的：`approx_kl=0.00411`、`clip_fraction=0.0151`、`explained_variance=0.922`、`value_loss=101`，说明 PPO 还在有效更新，而不是像 LateLR 那样逐渐“冻住”。尾 20 轮的汇总也支持这一点：`LateD4` 的 `disc_reward_gap≈0.117`、`value_loss≈60.1`、`explained_variance≈0.966`，并且 final 仍强；这就是为什么它能把“290 后衰减”显著压住。 
+
+你上传的另外两份训练打印也进一步说明，**`B512` 不是解法**。`PPO_MINI_BATCH_SIZE=512` 时，seed44 在 230 轮最好也只有 `env_return=1.5625`，而且内部已经是 `approx_kl=0.000256`、`clip_fraction=0`、`value_loss=555`；seed43 更差，60 轮就出现 `approx_kl=5.13e-06`、`clip_fraction=0`、`value_loss=659`。这说明 batch 拉大后，actor 更容易不动，critic 更容易吃力，原来 `D5_S06` 在 290 左右的强峰值反而被压没了。  
+
+所以现在最合理的判断是：
+
+* **如果你要论文里“单个 checkpoint 最强”**，仍然首选 `D5_S06_seed44 @ epoch 290`。
+* **如果你要“训练跑满 300 轮后还能稳定很强”的正式配置**，当前应该切到 `LateD4`。 
+
+我建议你把正式训练主线锁成这一套，不要再横向散扫：
+
+```python
+PPO_EPOCHS = 6
+PPO_MINI_BATCH_SIZE = 256
+GENERATOR_LEARNING_RATE = 8e-5
+DISCRIMINATOR_LEARNING_RATE = 5e-5
+SAFETY_REGULATOR_COEFF = 0.06
+PPO_ENT_COEF = 0.005
+N_DISC_UPDATES = 5
+late_n_disc_epoch = 240
+late_n_disc_updates = 4
+ENABLE_REWARD_NORMALIZATION = False
+save_freq_epochs = 5
+full_eval_episodes = 40
+best_select_start_epoch = 260
+```
+
+这正是 `LateD4` 这轮实际使用并跑出稳定 final 的配置。
+
+不建议再继续碰的方向也很明确：
+
+* `LateLR`
+* `PPO_MINI_BATCH_SIZE = 512`
+* `n_disc = 6`
+* `sreg >= 0.07` 当主线再扫
+
+这些方向前面的 probe 已经给出负面证据了。  
+
+如果你还想做**最后一个**很小的 probe，我只建议试一个：
+把 `late_n_disc_epoch` 从 **240 改到 250**，其余完全不动。
+理由不是因为当前 LateD4 不好，而是它已经证明“后段减判别器更新”这个思路是对的；现在唯一还值得确认的是，**稍晚一点介入，会不会更接近 `D5_S06 @290` 的峰值，同时仍保住 300 轮 final**。除此之外，我不建议再开新轴。
+
+
+我看完这轮最新探针和详细日志了。结论很清楚：
+
+**LateD4 有效，LateLR 基本无效，B512 明确是负方向。**
+而且这不是“调参碰巧”。LateLR 和 LateD4 用的是同一条主线：`seed=44, ppo6, batch256, gen_lr=8e-5, disc_lr=5e-5, sreg=0.06`，区别只在 `epoch 240` 以后：LateLR 把 `gen lr` 降到 `4e-5`，LateD4 把 `n_disc_updates` 从 `5` 降到 `4`。所以两者后段差异，基本可以直接归因到这个 late-stage 动作本身。  
+
+先说模型层面的结论：
+
+**1）峰值最强仍然是 `D5_S06_seed44 @ epoch 290`。**
+它的最好点是 `merge=0.95, endpoint=1.00, safety=0.875, collision=0.125, env_return=1.85, dense=42.37`。这说明你原先那条 `D5_S06` 主线并没有被推翻，只是“300 轮以后守不住”。
+
+**2）如果看“跑满 300 轮还能保持强”，目前最好的就是 `LateD4 @ epoch 300`。**
+它最终点做到 `merge=0.90, endpoint=1.00, safety=0.875, collision=0.125, env_return=1.825, dense=41.95`，只比 `D5_S06_seed44@290` 的绝对峰值略低一点，但明显比原始 `D5_S06` 的 300 轮末端稳定。
+
+**3）LateLR 不值得继续。**
+它不是没出过好点，`epoch 230` 左右其实很强；但到 `epoch 300` 已经掉成 `merge=0.075, endpoint=0.625, safety=0.575, collision=0.050, env_return=0.925`。也就是说，“后段降 generator lr”没有解决漂移，只是把 actor 更快冻住了。
+
+**4）B512 可以彻底停掉。**
+两条 B512 线都退步了：`seed43` 最好只到 `epoch 80, env=1.5125`，`seed44` 最好也只到 `epoch 230, env=1.5625`，都明显弱于原始 `D5_S06` 在 `epoch 290` 的水平。 
+
+再说为什么会这样。
+
+LateD4 之所以靠谱，不只是看最终指标，而是**训练内部状态也更健康**。
+在 `epoch 300`，LateD4 的 `disc_reward_gap≈0.114`、`value_loss≈33.9`、`explained_variance≈0.982`、`approx_kl≈0.00577`、`clip_fraction≈0.0216`。这说明后段 actor 还在正常更新，critic 也没有被 reward 漂移拖爆。
+
+LateLR 则相反。
+它到 `epoch 290` 时虽然评估面上还不算差，但已经出现了 `learning_rate=4e-05`、`approx_kl≈0.00193`、`clip_fraction≈0.000488`、`value_loss≈124` 的形态。这个组合很典型：**actor 基本不怎么动了，critic 还在硬追**。所以它后面崩，不是偶然。
+
+B512 更明显。
+`seed43` 在 `epoch 290` 已经是 `disc_reward_gap≈0.716, value_loss≈408, approx_kl≈2.0e-4, clip_fraction=0`；`seed44` 也有 `disc_reward_gap≈0.369, value_loss≈222, approx_kl≈3.5e-4, clip_fraction=0`。这说明 batch 拉到 512 后，PPO 更新过于迟钝，判别器重新把 generator 甩开了。 
+
+所以这轮日志给出的最重要判断是：
+
+**你当前真正该保留的“正式训练配方”不是 LateLR，也不是 B512，而是：**
+
+```python
+PPO_EPOCHS = 6
+PPO_MINI_BATCH_SIZE = 256
+GENERATOR_LEARNING_RATE = 8e-5
+DISCRIMINATOR_LEARNING_RATE = 5e-5
+SAFETY_REGULATOR_COEFF = 0.06
+N_DISC_UPDATES = 5
+# late-stage schedule:
+epoch >= 240  ->  n_disc_updates_per_round = 4
+```
+
+这正是当前 LateD4 的有效配置。
+
+### 我建议的下一步
+
+不要再做大范围横扫了。现在最该做的是两件事：
+
+第一，**把 LateD4 做复验**。
+当前 LateD4 只在 `seed=44` 跑通了，还不能直接宣布它是最终主线。下一步最值得跑的是：
+
+* `P300_S06_LateD4_s43`
+* `P300_S06_LateD4_s42`
+
+其它参数一律不动，继续保留 `save_freq=5`、`full_eval=40`。如果这两个 seed 也能在 `260–300` 区间稳定保持 `env_return≈1.7+`，那 LateD4 就可以升格为正式稳定版。
+
+第二，**如果还想微调，只动“late_n_disc 的切换时点”，不要再动 batch 或 gen lr。**
+最有信息量的两组是：
+
+* `late_n_disc_epoch = 230`
+* `late_n_disc_epoch = 250`
+
+原因很简单：这轮已经证明“把后段判别器减速”是对症的；那么下一步最合理的，就是微调“何时减速”，而不是再去试已经被否掉的 `B512` 或 `LateLR`。 
+
+### 现在怎么选模型
+
+如果你现在就要拿模型做结果，我会这样选：
+
+**要绝对峰值最强：**
+用 `D5_S06_seed44 @ epoch 290`
+
+**要跑满 300 轮还稳定：**
+用 `LateD4 @ epoch 300`
+
+一句话总结：
+**这轮日志已经把方向定死了——后段该减的是判别器更新次数，不是 generator 学习率；batch=512 也不该再碰。**

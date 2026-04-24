@@ -1,0 +1,65 @@
+已按 `探针调参.txt` 跑完 A-D 四组 100 轮 probe，并汇总结果。结论很清楚：**B 组最好**。
+
+推荐参数：
+
+```python
+PPO_EPOCHS = 6
+GENERATOR_LEARNING_RATE = 8e-5
+ENABLE_REWARD_NORMALIZATION = False
+```
+
+也就是：
+
+```text
+B_ppo6_glr8e5
+```
+
+汇总表已保存到：
+
+[probe_sweep_summary_20260418_211159.csv](D:/NGsim数据集/GYM基线%20-%20副本%20-4.13训练指标比较好%20-%20副本/train_log/probe_sweep_summary_20260418_211159.csv)
+
+**核心对比**
+
+| Probe | PPO_EPOCHS | Gen LR | 最佳轮次 | merge | endpoint | safety | collision | env return | dense |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| A 当前基线 | 8 | 8e-5 | 70 | 0.80 | 0.90 | 0.50 | 0.50 | 1.35 | 34.54 |
+| B | 6 | 8e-5 | 70 | 0.80 | 0.90 | 0.60 | 0.40 | 1.45 | 39.57 |
+| C | 6 | 7e-5 | 90 | 0.80 | 0.90 | 0.60 | 0.40 | 1.45 | 38.67 |
+| D | 8 | 7e-5 | 90 | 0.80 | 0.90 | 0.60 | 0.40 | 1.45 | 38.17 |
+
+看 100 轮最终点：
+
+| Probe | merge | endpoint | safety | collision | env return | dense |
+|---|---:|---:|---:|---:|---:|---:|
+| A | 0.60 | 0.60 | 0.40 | 0.40 | 1.00 | 30.42 |
+| B | 0.80 | 0.90 | 0.60 | 0.40 | 1.45 | 38.65 |
+| C | 0.80 | 0.80 | 0.60 | 0.40 | 1.40 | 38.01 |
+| D | 0.80 | 0.50 | 0.40 | 0.40 | 1.05 | 37.04 |
+
+**判断**
+
+B 组最稳：从 20 轮开始就到 `merge=0.8 / endpoint=0.9 / safety=0.6 / collision=0.4`，后面基本维持住，100 轮也没有像 A、D 那样掉下去。
+
+C 组也不错，`paper_rank_score_mean` 比 B 略高，说明动作/轨迹质量指标可能稍好一点；但 endpoint 在 100 轮是 `0.8`，低于 B 的 `0.9`。如果论文主指标优先成功率和安全率，我选 B；如果更看重平滑性和 paper rank，可以把 C 作为候选二号。
+
+D 不推荐：虽然 60-90 轮不错，但 100 轮 endpoint 掉到 `0.5`，不稳定。A 是当前短程基线，明显不如 B/C。
+
+**下一步建议**
+
+先用 B 组跑完整 300 轮：
+
+```python
+PPO_EPOCHS = 6
+GENERATOR_LEARNING_RATE = 8e-5
+```
+
+其他参数保持不变。
+
+如果 B 的 300 轮仍然中后期波动，再试 C：
+
+```python
+PPO_EPOCHS = 6
+GENERATOR_LEARNING_RATE = 7e-5
+```
+
+我这次没有跑 E 组 `ENABLE_REWARD_NORMALIZATION=True`，因为 A-D 已经分出方向了，B/C 明显比 A 稳。E 可以作为下一轮补充 probe，而不是现在优先项。

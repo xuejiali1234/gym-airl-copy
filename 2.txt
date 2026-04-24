@@ -1,143 +1,193 @@
-所以现在不要先急着下结论说“模型没学到”或者“必须重新大调参”。先把评价锚点修正掉。最值得立刻做的是这三件：
+先纠正一个关键点：
 
-第一，在训练前补一条真正的 epoch 0 评估。
-第二，把当前 dense score 改成相对基线分数，而不是 raw 分数：
+`Policy_Return_Components_Norm100.png` **不是** `eval_dense_return_norm100`。
+这张图的脚本 `plot_policy_return_components.py` 读的是 `eval_ep_rew_mean`，然后按环境奖励预算 `0.5/0.5/1.0` 拆成 merge、endpoint、safety 三项；本质上它画的是**稀疏环境回报及其成功率分解**，不是 dense eval reward。
 
-𝑠
-𝑐
-𝑜
-𝑟
-𝑒
-rel
-=
-100
-⋅
-𝑅
-𝜋
-−
-𝑅
-rand
-𝑅
-expert
-−
-𝑅
-rand
-+
-𝜖
-score
-rel
-	​
+而 `plot_dense_evaluation_score.py` 才是另一套指标。它重新加载 checkpoint，按自定义的 dense step reward + terminal bonus 计算 `dense_eval_score_mean`，再做
+[
+100 \cdot \frac{J_t - J_{\text{random}}}{J_{\text{expert}} - J_{\text{random}}}
+]
+这种 random/expert 归一化。
 
-=100⋅
-R
-expert
-	​
+所以你现在其实有两类完全不同的曲线：
 
-−R
-rand
-	​
+环境侧稀疏回报曲线。
+它天生是台阶状、离散的，因为本质就是 success rate 的加权和，不会长成经典 RL 那种平滑爬升。
 
-+ϵ
-R
-π
-	​
+dense 评估曲线。
+它更接近“任务评分”，有希望更像学习曲线，但你当前这版又用了 **random baseline** 做分母，导致尺度非常容易失真，甚至远超 100。只要 `expert - random` 的差不大，这条曲线就会被放大得很夸张。
 
-−R
-rand
-	​
+所以，直接回答你这句：
 
-	​
+**论文里最应该放的，不是现在这三张里的任意原样版本。**
+最合适的是：
 
+## 主图放什么
 
-这里 R_rand 是未训练策略的 dense return，R_expert 是 expert 轨迹在同一 eval reward 下的 dense return。这样做以后，未训练就会靠近 0，expert 靠近 100，训练曲线才有“从低往上爬”的解释力。
+放一条新的主曲线：
 
-第三，把 dense reward 里那些“每步几乎总是正的项”做零中心化。
-比如 speed / TTC / THW 这类项，不要直接加正值，而改成：
+[
+\text{Normalized Dense Task Score}
+==================================
 
-𝑟
-𝑣
-=
-𝑤
-𝑣
-(
-c
-l
-i
-p
-(
-𝑣
-/
-𝑣
-ref
-,
-0
-,
-1
-)
-−
-0.5
-)
-r
-v
-	​
+100 \cdot \frac{J_t - J_0}{J_{\text{expert}} - J_0 + \varepsilon}
+]
 
-=w
-v
-	​
+其中：
 
-(clip(v/v
-ref
-	​
+* (J_t)：第 (t) 个 checkpoint 的 dense evaluation score
+* (J_0)：**未训练初始策略**在同一 dense evaluator 下的得分
+* (J_{\text{expert}})：expert 轨迹在同一 dense evaluator 下的得分
 
-,0,1)−0.5)
-𝑟
-𝑡
-𝑡
-𝑐
-=
-𝑤
-𝑡
-(
-c
-l
-i
-p
-(
-𝑇
-𝑇
-𝐶
-/
-𝑇
-ref
-,
-0
-,
-1
-)
-−
-0.5
-)
-r
-ttc
-	​
+这条曲线我建议命名成：
 
-=w
-t
-	​
+**Normalized Dense Task Score (epoch-0=0, expert=100)**
 
-(clip(TTC/T
-ref
-	​
+或者更直接一点：
 
-,0,1)−0.5)
+**Expert-Gap-Closed Under Dense Evaluation Reward**
 
-这样弱策略不会因为“活着跑了几十步”就白拿一堆正分。
+这个版本有三个好处：
 
-还有一个小点也会让你感觉“差距不大”：你当前 quick eval 只有 8 个 episodes，所以单点波动非常大，成功率每跳一次就是 12.5%。这会让前期和中期的曲线看上去又抖、又不容易拉开。
+第一，它从 0 起步。因为基线是 `epoch 0`，不是 random policy。
+第二，它仍然和 expert 对齐，100 有明确含义。
+第三，它是 dense evaluator，下方再配 success/collision，更像论文里可解释的任务学习曲线。
 
-一句话总结：
+---
 
-现在的问题不是“未训练模型真的有 40 分实力”，而是“你的 dense score 不是以随机策略为 0 的刻度”。
-先把 epoch 0、random baseline、expert baseline 补上，再看训练增益；不然你会一直觉得“训练了半天怎么只比没训练高一点点”。
+## 哪两个不要当主图
 
-下一步最值得做的是：先把当前 plot 脚本改成 random-normalized score，再决定要不要继续调参。
+### 1）不要用 `Policy_Return_Components_Norm100` 当主图
+
+因为它本质就是：
+
+[
+25 \cdot merge + 25 \cdot endpoint + 50 \cdot safety
+]
+
+它适合做**解释图**，不适合做主 learning curve。
+它永远更像“成功率分解”，不会像连续 RL return。
+
+### 2）不要用当前的 random-normalized dense 图当主图
+
+因为你现在脚本里用的是 random baseline，不是未训练策略；而且分母是 `expert-random`，这个差值一小，曲线就会被放大到 200、300、500。
+这不是你模型真的“远超 expert 五倍”，而是归一化定义本身不稳。
+
+---
+
+## 为什么你总觉得“没有 RL 那样从低到高再收敛”
+
+因为你当前画图还混了两个问题。
+
+一个是**指标定义**。
+环境回报本来就稀疏；组件图本来就离散；dense 图又被 random normalization 放大。
+
+另一个是**训练本身确实有中期失稳**。
+你当前日志里，中段多次出现 `approx_kl` 极低、`clip_fraction` 接近 0、但 `value_loss` 冲到 800–1200 的情况，这说明那一段 PPO 几乎没怎么动，critic 在追一个很不稳的目标，所以曲线中途回落并不只是“图没画好”，而是训练过程确实抖。
+
+所以，没有哪个诚实的指标能**保证**长成标准 RL 教科书式曲线。
+你能做的是让主图更合理、更稳定、更可解释，而不是硬找一条“看起来像 RL”的线。
+
+---
+
+## 论文里推荐怎么放
+
+最稳的一套是：
+
+上图：
+**Normalized Dense Task Score (epoch-0=0, expert=100)**
+只画 **full-eval** 点。
+
+下图：
+`endpoint_success_rate`、`safety_success_rate`、`collision_rate`
+
+表格：
+best checkpoint 的 `eval_ep_rew_mean / endpoint / safety / collision / TTC / jerk(or comfort)`。
+
+这也更接近你上传论文的评估逻辑。那篇论文核心看的就是效率、安全、舒适等指标，而不是要求某条 reward curve 必须长成 RL 样子。
+
+---
+
+## 你现在代码里该怎么改
+
+你当前配置已经是：
+
+* `eval_freq_epochs = 1`
+* `quick_eval_episodes = 8`
+* `full_eval_episodes = 20`
+* `save_freq_epochs = 20`
+* `PPO_EPOCHS = 8`
+* `GENERATOR_LEARNING_RATE = 8e-5`。
+
+这意味着 `eval_metrics.csv` 本身就混了 quick eval 和 full eval。
+所以论文主图不要直接把所有 epoch 连起来。
+
+### 正确做法
+
+只取：
+
+* `epoch 0`
+* `epoch 20`
+* `epoch 40`
+* …
+* `epoch 300`
+
+这些 full-eval 点来画主图。
+因为 `save_freq_epochs=20`，这些点才和 checkpoint/full eval 对齐。
+
+### 归一化改法
+
+把 `plot_dense_evaluation_score.py` 里的 random baseline 归一化，改成 epoch-0 归一化。
+
+也就是把这段逻辑：
+
+```python
+df["dense_eval_score_rel_mean"] = 100.0 * (df["dense_eval_score_mean"] - random_mean) / denom
+```
+
+改成：
+
+```python
+J0 = float(df.loc[df["epoch"] == 0, "dense_eval_score_mean"].iloc[0])
+Je = float(expert_mean)
+denom = Je - J0 if abs(Je - J0) > 1e-8 else 1e-8
+
+df["dense_eval_score_epoch0_expert_norm"] = 100.0 * (df["dense_eval_score_mean"] - J0) / denom
+```
+
+然后主图画 `dense_eval_score_epoch0_expert_norm`。
+
+### 画图名称也要改
+
+不要再叫 `Policy Return`。
+因为这不是 raw environment return。
+
+建议标题直接写：
+
+**Learning Curve Under Dense Evaluation Reward**
+或
+**Normalized Dense Task Score (epoch-0=0, expert=100)**
+
+---
+
+## 结论
+
+你现在最该放进论文主图的，是：
+
+**full-eval only 的、以 epoch-0 为 0、expert 为 100 的 dense task score。**
+
+不是：
+
+* `Policy_Return_Components_Norm100`
+* 也不是当前 random-normalized dense 图
+
+原因很简单：
+
+* 前者本质是 success 分解，不会像 RL
+* 后者归一化不稳，数值会失真
+* 只有 `epoch0→expert` 归一化的 dense score，既能从低分起步，又保留任务语义，还比较像学习曲线
+
+但最后要接受一件事：
+**如果换成这条曲线后仍然没有明显“低到高再收敛”，那就不是画图问题，而是当前训练本身还不够稳。**
+
+下一步最有效的动作，不是继续换指标，而是先把这条主图改成 `epoch0/expert` 归一化，再只看 full-eval 点；如果它还是中期明显回落，那就再去做你前面那组小范围参数 probe。
