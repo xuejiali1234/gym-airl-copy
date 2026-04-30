@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 
 
@@ -24,13 +26,18 @@ class SafetyOracleQ:
         *,
         collision_margin: float = 1.1,
         ttc_threshold: float = 3.0,
+        warning_ttc_threshold: Optional[float] = None,
+        warning_weight: float = 1.0,
         lane_x_tolerance: float = 10.0,
     ) -> None:
         self.cfg = cfg
         self.mean = torch.as_tensor(mean[:16], dtype=torch.float32)
         self.std = torch.as_tensor(std[:16], dtype=torch.float32)
         self.collision_margin = float(collision_margin)
-        self.ttc_threshold = float(ttc_threshold)
+        self.ttc_threshold = float(getattr(cfg, "SAFETY_ORACLE_TTC_THRESHOLD", ttc_threshold))
+        cfg_warning = getattr(cfg, "SAFETY_ORACLE_WARNING_TTC_THRESHOLD", warning_ttc_threshold)
+        self.warning_ttc_threshold = None if cfg_warning is None else float(cfg_warning)
+        self.warning_weight = float(getattr(cfg, "SAFETY_ORACLE_WARNING_WEIGHT", warning_weight))
         self.lane_x_tolerance = float(lane_x_tolerance)
 
         self.vehicle_w = float(cfg.VEHICLE_WIDTH)
@@ -69,6 +76,22 @@ class SafetyOracleQ:
         valid_ttc = ttc < self.ttc_threshold
         return valid_x & valid_y & valid_speed & valid_ttc
 
+    def _ttc_warning_risk(self, dx: torch.Tensor, dy: torch.Tensor, dvy: torch.Tensor) -> torch.Tensor:
+        if self.warning_ttc_threshold is None or self.warning_ttc_threshold <= self.ttc_threshold:
+            return torch.zeros_like(dy)
+
+        valid_x = torch.abs(dx) <= self.lane_x_tolerance
+        valid_y = dy > 0.1
+        rel_speed = -dvy
+        valid_speed = rel_speed > 0.1
+        safe_rel_speed = torch.clamp(rel_speed, min=1e-3)
+        ttc = dy / safe_rel_speed
+
+        warning = torch.clamp((self.warning_ttc_threshold - ttc) / self.warning_ttc_threshold, min=0.0, max=1.0)
+        warning = warning * float(self.warning_weight)
+        active = valid_x & valid_y & valid_speed & (ttc >= self.ttc_threshold) & (ttc < self.warning_ttc_threshold)
+        return torch.where(active, warning, torch.zeros_like(warning))
+
     def _unsafe_from_raw_state(self, raw_states: torch.Tensor) -> torch.Tensor:
         dx_l6, dy_l6, _, dvy_l6 = raw_states[:, 4], raw_states[:, 5], raw_states[:, 6], raw_states[:, 7]
         dx_l5, dy_l5, _, dvy_l5 = raw_states[:, 8], raw_states[:, 9], raw_states[:, 10], raw_states[:, 11]
@@ -82,6 +105,16 @@ class SafetyOracleQ:
         ttc_risk = self._is_low_ttc(dx_l6, dy_l6, dvy_l6) | self._is_low_ttc(dx_l5, dy_l5, dvy_l5)
         is_unsafe = collision_risk | ttc_risk
         return is_unsafe.float().unsqueeze(1)
+
+    def _soft_risk_from_raw_state(self, raw_states: torch.Tensor) -> torch.Tensor:
+        hard_risk = self._unsafe_from_raw_state(raw_states)
+        dx_l6, dy_l6, _, dvy_l6 = raw_states[:, 4], raw_states[:, 5], raw_states[:, 6], raw_states[:, 7]
+        dx_l5, dy_l5, _, dvy_l5 = raw_states[:, 8], raw_states[:, 9], raw_states[:, 10], raw_states[:, 11]
+        warning = torch.maximum(
+            self._ttc_warning_risk(dx_l6, dy_l6, dvy_l6),
+            self._ttc_warning_risk(dx_l5, dy_l5, dvy_l5),
+        ).unsqueeze(1)
+        return torch.maximum(hard_risk, warning).clamp(0.0, 1.0)
 
     def _rollout_one_step(self, raw_states: torch.Tensor, raw_actions: torch.Tensor) -> torch.Tensor:
         next_states = raw_states.clone()
@@ -132,16 +165,16 @@ class SafetyOracleQ:
 
         return next_states
 
-    def get_labels(self, states_tensor: torch.Tensor, actions: torch.Tensor | None = None) -> torch.Tensor:
+    def get_labels(self, states_tensor: torch.Tensor, actions: Optional[torch.Tensor] = None) -> torch.Tensor:
         raw_states = self._denormalize_state(states_tensor)
-        current_unsafe = self._unsafe_from_raw_state(raw_states)
+        current_risk = self._soft_risk_from_raw_state(raw_states)
         if actions is None:
-            return current_unsafe
+            return current_risk
 
         raw_actions = self._denormalize_action(actions)
         raw_next = self._rollout_one_step(raw_states, raw_actions)
-        next_unsafe = self._unsafe_from_raw_state(raw_next)
-        return torch.maximum(current_unsafe, next_unsafe)
+        next_risk = self._soft_risk_from_raw_state(raw_next)
+        return torch.maximum(current_risk, next_risk)
 
-    def check_safety_batch(self, states_tensor: torch.Tensor, actions: torch.Tensor | None = None) -> torch.Tensor:
+    def check_safety_batch(self, states_tensor: torch.Tensor, actions: Optional[torch.Tensor] = None) -> torch.Tensor:
         return self.get_labels(states_tensor, actions)

@@ -277,6 +277,15 @@ def apply_probe_overrides(cfg):
     set_if_present("PROBE_LATE_N_DISC_EPOCH", "PROBE_LATE_N_DISC_EPOCH", int)
     set_if_present("PROBE_LATE_N_DISC_UPDATES", "PROBE_LATE_N_DISC_UPDATES", int)
     set_if_present("PROBE_BEST_SELECT_START_EPOCH", "PROBE_BEST_SELECT_START_EPOCH", int)
+    set_if_present("PROBE_SAFETY_UNFREEZE_TIMESTEPS", "SAFETY_UNFREEZE_TIMESTEPS", int)
+    set_if_present("PROBE_SAFETY_LIGHT_UNFREEZE_LR", "SAFETY_LIGHT_UNFREEZE_LR", float)
+    set_if_present("PROBE_SAFETY_RAMP_UNFREEZE_EPOCHS", "PROBE_SAFETY_RAMP_UNFREEZE_EPOCHS", int)
+    set_if_present("PROBE_SAFETY_DECAY_EPOCH", "PROBE_SAFETY_DECAY_EPOCH", int)
+    set_if_present("PROBE_SAFETY_DECAY_LR", "PROBE_SAFETY_DECAY_LR", float)
+    set_if_present("PROBE_SAFETY_EMBED_DIM", "SAFETY_EMBED_DIM", int)
+    set_if_present("PROBE_SAFETY_ORACLE_TTC_THRESHOLD", "SAFETY_ORACLE_TTC_THRESHOLD", float)
+    set_if_present("PROBE_SAFETY_ORACLE_WARNING_TTC_THRESHOLD", "SAFETY_ORACLE_WARNING_TTC_THRESHOLD", float)
+    set_if_present("PROBE_SAFETY_ORACLE_WARNING_WEIGHT", "SAFETY_ORACLE_WARNING_WEIGHT", float)
     set_if_present("PROBE_SAFETY_REG_COEFF", "SAFETY_REGULATOR_COEFF", float)
     set_if_present("PROBE_ENT_COEF", "PPO_ENT_COEF", float)
     set_if_present("PROBE_SAVE_FREQ_EPOCHS", "PROBE_SAVE_FREQ_EPOCHS", int)
@@ -288,6 +297,11 @@ def apply_probe_overrides(cfg):
     if reward_norm is not None:
         cfg.ENABLE_REWARD_NORMALIZATION = reward_norm
         overrides["ENABLE_REWARD_NORMALIZATION"] = reward_norm
+
+    safety_fuse_feature = parse_env_bool("PROBE_SAFETY_FUSE_FEATURE")
+    if safety_fuse_feature is not None:
+        cfg.SAFETY_FUSE_FEATURE = safety_fuse_feature
+        overrides["SAFETY_FUSE_FEATURE"] = safety_fuse_feature
 
     return overrides
 
@@ -309,6 +323,8 @@ def main():
     enable_safety_aux = enable_safety and getattr(cfg, "ENABLE_SAFETY_AUX_LOSS", True)
     enable_reward_norm = getattr(cfg, "ENABLE_REWARD_NORMALIZATION", False)
     debug_use_ground_truth_reward = getattr(cfg, "DEBUG_USE_GROUND_TRUTH_REWARD", False)
+    safety_fuse_feature = enable_safety and getattr(cfg, "SAFETY_FUSE_FEATURE", False)
+    safety_embed_dim = int(getattr(cfg, "SAFETY_EMBED_DIM", 8 if safety_fuse_feature else 1))
     
     # ==========================================
     # 1. 文件夹与日志系统初始化
@@ -352,7 +368,7 @@ def main():
         print(
             "[*] 当前安全模块: 新 Q 安全模块 "
             f"(use_action={getattr(cfg, 'SAFETY_USE_ACTION', True)}, "
-            "fuse_feature=scalar_only, "
+            f"fuse_feature={'feature_fusion' if safety_fuse_feature else 'scalar_only'}, "
             f"branch={'real' if enable_safety_branch else 'zero'}, "
             f"aux_loss={enable_safety_aux}, "
             f"reg_weight={getattr(cfg, 'SAFETY_REGULATOR_COEFF', 0.0) if enable_safety_aux else 0.0})"
@@ -446,9 +462,9 @@ def main():
                 action_space=env.action_space,
                 safety_net=safety_net,
                 hidden_dim=64,
-                safety_embed_dim=1,
+                safety_embed_dim=safety_embed_dim,
                 freeze_safety=True,
-                fuse_safety_feature=False,
+                fuse_safety_feature=safety_fuse_feature,
             )
         else:
             base_reward_net = AttentionRewardNet(
@@ -483,9 +499,9 @@ def main():
                 observation_space=env.observation_space,
                 action_space=env.action_space,
                 safety_net=safety_net,
-                safety_embed_dim=1,
+                safety_embed_dim=safety_embed_dim,
                 freeze_safety=True,
-                fuse_safety_feature=False,
+                fuse_safety_feature=safety_fuse_feature,
             )
         else:
             base_reward_net = BasicRewardNet(
@@ -592,12 +608,22 @@ def main():
     n_eval_episodes = full_eval_episodes
     safety_unfreeze_timesteps = getattr(cfg, "SAFETY_UNFREEZE_TIMESTEPS", 100000)
     safety_light_unfreeze_lr = getattr(cfg, "SAFETY_LIGHT_UNFREEZE_LR", 1e-5)
+    safety_ramp_unfreeze_epochs = getattr(cfg, "PROBE_SAFETY_RAMP_UNFREEZE_EPOCHS", 0)
+    safety_decay_epoch = getattr(cfg, "PROBE_SAFETY_DECAY_EPOCH", None)
+    safety_decay_lr = getattr(cfg, "PROBE_SAFETY_DECAY_LR", None)
     safety_phase = "frozen" if enable_safety else "disabled"
+    safety_current_grad_scale = 0.0
     total_train_timesteps = total_epochs * cfg.STEPS_PER_EPOCH
     safety_grad_scale = min(
         1.0,
         safety_light_unfreeze_lr / max(float(cfg.DISCRIMINATOR_LEARNING_RATE), 1e-12),
     )
+    safety_decay_grad_scale = None
+    if safety_decay_epoch is not None and safety_decay_lr is not None:
+        safety_decay_grad_scale = min(
+            1.0,
+            safety_decay_lr / max(float(cfg.DISCRIMINATOR_LEARNING_RATE), 1e-12),
+        )
     save_run_metadata(
         log_dir,
         {
@@ -631,12 +657,20 @@ def main():
                 "safety_enabled": enable_safety,
                 "safety_branch_enabled": enable_safety_branch,
                 "safety_aux_enabled": enable_safety_aux,
-                "safety_fusion_effective": "scalar_only" if enable_safety else "disabled",
+                "safety_fusion_effective": "feature_fusion" if safety_fuse_feature else ("scalar_only" if enable_safety else "disabled"),
+                "safety_embed_dim": safety_embed_dim if enable_safety else 0,
                 "safety_loss_weight_effective": cfg.SAFETY_REGULATOR_COEFF if enable_safety_aux else 0.0,
                 "reward_normalization_enabled": enable_reward_norm,
                 "reward_normalization_layer": "RunningNorm" if enable_reward_norm else "disabled",
                 "debug_use_ground_truth_reward": debug_use_ground_truth_reward,
                 "safety_phase_initial": safety_phase,
+                "safety_unfreeze_timesteps": safety_unfreeze_timesteps,
+                "safety_light_unfreeze_lr": safety_light_unfreeze_lr,
+                "safety_target_grad_scale": safety_grad_scale,
+                "safety_ramp_unfreeze_epochs": safety_ramp_unfreeze_epochs,
+                "safety_decay_epoch": safety_decay_epoch,
+                "safety_decay_lr": safety_decay_lr,
+                "safety_decay_grad_scale": safety_decay_grad_scale,
             },
         },
     )
@@ -649,11 +683,70 @@ def main():
                 f"(unfreeze_after={safety_unfreeze_timesteps} > total_train_timesteps={total_train_timesteps})"
             )
         else:
-            print(
-                "[*] Safety schedule: freeze -> light_unfreeze "
-                f"(unfreeze_after={safety_unfreeze_timesteps}, "
-                f"safety_lr~{safety_light_unfreeze_lr:.1e})"
-            )
+            if safety_ramp_unfreeze_epochs > 0:
+                print(
+                    "[*] Safety schedule: freeze -> ramp_unfreeze -> light_unfreeze "
+                    f"(unfreeze_after={safety_unfreeze_timesteps}, "
+                    f"ramp_epochs={safety_ramp_unfreeze_epochs}, "
+                    f"safety_lr~{safety_light_unfreeze_lr:.1e})"
+                )
+            else:
+                print(
+                    "[*] Safety schedule: freeze -> light_unfreeze "
+                    f"(unfreeze_after={safety_unfreeze_timesteps}, "
+                    f"safety_lr~{safety_light_unfreeze_lr:.1e})"
+                )
+            if safety_decay_epoch is not None and safety_decay_grad_scale is not None:
+                print(
+                    "[*] Safety late decay enabled "
+                    f"(decay_epoch={safety_decay_epoch}, "
+                    f"decay_lr~{safety_decay_lr:.1e}, "
+                    f"decay_grad_scale={safety_decay_grad_scale:.3f})"
+                )
+
+    def update_safety_phase_for_epoch(epoch_to_train):
+        nonlocal safety_phase, safety_current_grad_scale
+        if not (
+            enable_safety
+            and hasattr(base_reward_net, "set_safety_training_phase")
+            and safety_unfreeze_timesteps <= total_train_timesteps
+        ):
+            return
+
+        unfreeze_epoch = safety_unfreeze_timesteps / float(cfg.STEPS_PER_EPOCH)
+        if epoch_to_train <= unfreeze_epoch:
+            return
+
+        if safety_ramp_unfreeze_epochs > 0:
+            ramp_fraction = (epoch_to_train - unfreeze_epoch) / float(safety_ramp_unfreeze_epochs)
+            ramp_fraction = min(1.0, max(0.0, ramp_fraction))
+            next_grad_scale = safety_grad_scale * ramp_fraction
+            next_phase = "ramp_unfreeze" if ramp_fraction < 1.0 else "light_unfreeze"
+        else:
+            next_grad_scale = safety_grad_scale
+            next_phase = "light_unfreeze"
+
+        if (
+            safety_decay_epoch is not None
+            and safety_decay_grad_scale is not None
+            and epoch_to_train >= safety_decay_epoch
+        ):
+            next_grad_scale = safety_decay_grad_scale
+            next_phase = "decay_unfreeze"
+
+        if next_grad_scale <= 0.0:
+            return
+        if safety_phase == next_phase and abs(safety_current_grad_scale - next_grad_scale) < 1e-8:
+            return
+
+        base_reward_net.set_safety_training_phase("light_unfreeze", grad_scale=next_grad_scale)
+        safety_phase = next_phase
+        safety_current_grad_scale = next_grad_scale
+        print(
+            "[*] Safety schedule updated "
+            f"(epoch_to_train={epoch_to_train}, phase={safety_phase}, "
+            f"grad_scale={safety_current_grad_scale:.3f})"
+        )
 
     train_mode = "S-AIRL" if enable_safety else "GC-AIRL no-safety ablation"
     print(f"[*] 开始 {train_mode} 训练...")
@@ -718,18 +811,7 @@ def main():
             current_n_disc_updates = late_n_disc_updates
         if hasattr(airl_trainer, "n_disc_updates_per_round"):
             airl_trainer.n_disc_updates_per_round = current_n_disc_updates
-        if (
-            enable_safety
-            and hasattr(base_reward_net, "set_safety_training_phase")
-            and safety_phase == "frozen"
-            and learner.num_timesteps >= safety_unfreeze_timesteps
-        ):
-            base_reward_net.set_safety_training_phase("light_unfreeze", grad_scale=safety_grad_scale)
-            safety_phase = "light_unfreeze"
-            print(
-                "[*] Safety schedule switched to light_unfreeze "
-                f"(timesteps={learner.num_timesteps}, grad_scale={safety_grad_scale:.3f})"
-            )
+        update_safety_phase_for_epoch(chunk_start_epoch)
         # ==========================================
         
         last_eval_metrics = {}
@@ -766,6 +848,9 @@ def main():
                 f"safety={eval_metrics['safety_success_rate']:.3f}, "
                 f"collision={eval_metrics['collision_rate']:.3f}"
             )
+            next_train_epoch = current_eval_epoch + 1
+            if next_train_epoch <= total_epochs:
+                update_safety_phase_for_epoch(next_train_epoch)
 
         airl_trainer.train(total_timesteps=steps_per_chunk, callback=eval_callback)
         current_epoch = (chunk + 1) * save_freq_epochs

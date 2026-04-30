@@ -1,0 +1,7 @@
+<connections>
+    <connection from="main_in" to="merge_zone" fromLane="0" toLane="1"/>
+    <connection from="main_in" to="merge_zone" fromLane="1" toLane="2"/>
+    <connection from="ramp_in" to="merge_zone" fromLane="0" toLane="0"/>
+    <connection from="merge_zone" to="main_out" fromLane="1" toLane="0"/>
+    <connection from="merge_zone" to="main_out" fromLane="2" toLane="1"/>
+</connections>

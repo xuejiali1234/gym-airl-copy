@@ -76,3 +76,8 @@ train_log/*
 
 # IDE / local tooling
 .idea/
+
+# SUMO / transfer generated outputs
+sumo测试/outputs/
+data-I80/轨迹绘制/U220_*/
+data-I80/轨迹绘制1/U220_*/

@@ -307,8 +307,9 @@ class MergingDataset(Dataset):
                 # 过滤掉 _normalized 文件夹中的文件
                 if '_normalized' in csv_file:
                     continue
+                filename = os.path.basename(csv_file)
                 df = pd.read_csv(csv_file)
-                self._process_data(df, os.path.basename(csv_file))
+                self._process_data(df, filename)
             except Exception as e:
                 print(f"Error loading {csv_file}: {e}")
 

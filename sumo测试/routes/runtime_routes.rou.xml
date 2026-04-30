@@ -1,0 +1,6 @@
+<routes>
+    <vType id="bg_car" accel="2.6" decel="4.5" sigma="0.5" length="4.8" minGap="2.0" maxSpeed="31.0"/>
+    <vType id="rl_car" accel="3.0" decel="4.5" sigma="0.0" length="4.8" minGap="2.0" maxSpeed="28.0"/>
+    <route id="main_bg_route" edges="main_in merge_zone main_out"/>
+    <route id="ramp_route" edges="ramp_in merge_zone main_out"/>
+</routes>

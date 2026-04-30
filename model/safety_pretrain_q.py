@@ -70,7 +70,7 @@ def build_safety_training_tensors(
     synthetic_multiplier: float = 1.0,
     device: str | torch.device = "cpu",
     seed: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
     states, actions = _stack_all_state_action(dataset)
     sample_generator = _make_generator(seed, device="cpu")
     if states.shape[0] > max_pairs:
@@ -84,10 +84,9 @@ def build_safety_training_tensors(
     with torch.no_grad():
         labels = oracle.get_labels(states, actions).squeeze(-1)
 
-    safe_states = states[labels < 0.5]
-    safe_actions = actions[labels < 0.5]
-    unsafe_states_from_data = states[labels >= 0.5]
-    unsafe_actions_from_data = actions[labels >= 0.5]
+    safe_mask = labels < 0.5
+    safe_states = states[safe_mask]
+    safe_actions = actions[safe_mask]
 
     synth_states, synth_actions = _generate_candidate_unsafe_actions(
         safe_states,
@@ -96,18 +95,18 @@ def build_safety_training_tensors(
     )
     with torch.no_grad():
         synth_labels = oracle.get_labels(synth_states, synth_actions).squeeze(-1)
-    unsafe_states_synth = synth_states[synth_labels >= 0.5]
-    unsafe_actions_synth = synth_actions[synth_labels >= 0.5]
+    synth_keep = synth_labels > 0.0
 
-    if unsafe_states_from_data.numel() == 0:
-        unsafe_states, unsafe_actions = unsafe_states_synth, unsafe_actions_synth
-    elif unsafe_states_synth.numel() == 0:
-        unsafe_states, unsafe_actions = unsafe_states_from_data, unsafe_actions_from_data
-    else:
-        unsafe_states = torch.cat([unsafe_states_from_data, unsafe_states_synth], dim=0)
-        unsafe_actions = torch.cat([unsafe_actions_from_data, unsafe_actions_synth], dim=0)
+    x_s = torch.cat([states, synth_states[synth_keep]], dim=0)
+    x_a = torch.cat([actions, synth_actions[synth_keep]], dim=0)
+    y = torch.cat([labels, synth_labels[synth_keep]], dim=0).unsqueeze(1).clamp(0.0, 1.0)
 
-    return safe_states.cpu(), safe_actions.cpu(), unsafe_states.cpu(), unsafe_actions.cpu()
+    stats = {
+        "n_safe": float((y < 0.5).sum().item()),
+        "n_unsafe": float((y >= 0.5).sum().item()),
+        "n_warning": float(((y > 0.0) & (y < 0.5)).sum().item()),
+    }
+    return x_s.cpu(), x_a.cpu(), y.cpu(), stats
 
 
 
@@ -129,7 +128,7 @@ def pretrain_safety_q_network(
 ) -> Dict[str, float]:
     safety_net = safety_net.to(device)
 
-    safe_s, safe_a, unsafe_s, unsafe_a = build_safety_training_tensors(
+    x_s, x_a, y, label_stats = build_safety_training_tensors(
         dataset,
         oracle,
         max_pairs=max_pairs,
@@ -138,20 +137,10 @@ def pretrain_safety_q_network(
         seed=seed,
     )
 
-    if safe_s.numel() == 0 or unsafe_s.numel() == 0:
+    if label_stats["n_safe"] <= 0 or label_stats["n_unsafe"] <= 0:
         raise RuntimeError(
-            f"Safety-Q pretraining failed: safe={safe_s.shape[0]}, unsafe={unsafe_s.shape[0]}"
+            f"Safety-Q pretraining failed: safe={label_stats['n_safe']}, unsafe={label_stats['n_unsafe']}"
         )
-
-    x_s = torch.cat([safe_s, unsafe_s], dim=0)
-    x_a = torch.cat([safe_a, unsafe_a], dim=0)
-    y = torch.cat(
-        [
-            torch.zeros(safe_s.shape[0], 1, dtype=torch.float32),
-            torch.ones(unsafe_s.shape[0], 1, dtype=torch.float32),
-        ],
-        dim=0,
-    )
 
     ds = TensorDataset(x_s, x_a, y)
     loader_generator = _make_generator(seed, device="cpu")
@@ -193,12 +182,14 @@ def pretrain_safety_q_network(
         if verbose:
             print(
                 f"[Safety-Q Pretrain] epoch={epoch + 1}/{epochs} loss={last_loss:.4f} "
-                f"safe={safe_s.shape[0]} unsafe={unsafe_s.shape[0]}"
+                f"safe={label_stats['n_safe']:.0f} unsafe={label_stats['n_unsafe']:.0f} "
+                f"warning={label_stats['n_warning']:.0f}"
             )
 
     safety_net.eval()
     return {
         "loss": float(last_loss),
-        "n_safe": float(safe_s.shape[0]),
-        "n_unsafe": float(unsafe_s.shape[0]),
+        "n_safe": float(label_stats["n_safe"]),
+        "n_unsafe": float(label_stats["n_unsafe"]),
+        "n_warning": float(label_stats["n_warning"]),
     }

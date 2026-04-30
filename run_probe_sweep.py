@@ -8,17 +8,20 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent
+STEPS_PER_EPOCH = 2048
+U220_TIMESTEPS = 220 * STEPS_PER_EPOCH
 
 BASE_ENV = {
     "PROBE_EPOCHS": "300",
     "PROBE_SAVE_FREQ_EPOCHS": "5",
     "PROBE_QUICK_EVAL_EPISODES": "8",
-    "PROBE_FULL_EVAL_EPISODES": "40",
+    "PROBE_FULL_EVAL_EPISODES": "100",
     "PROBE_REWARD_NORM": "0",
     "PROBE_BEST_SELECT_START_EPOCH": "260",
 }
 
 CONTROL_ENV = {
+    "PROBE_SEED": "44",
     "PROBE_PPO_EPOCHS": "6",
     "PROBE_PPO_MINI_BATCH_SIZE": "256",
     "PROBE_GENERATOR_LR": "8e-5",
@@ -27,43 +30,31 @@ CONTROL_ENV = {
     "PROBE_N_DISC_UPDATES": "5",
     "PROBE_ENT_COEF": "0.005",
     "PROBE_REWARD_NORM": "0",
+    "PROBE_LATE_N_DISC_EPOCH": "230",
+    "PROBE_LATE_N_DISC_UPDATES": "4",
+    "PROBE_SAFETY_FUSE_FEATURE": "0",
+    "PROBE_SAFETY_EMBED_DIM": "1",
 }
 
 EXPERIMENTS = [
     {
-        "name": "P300_S06_LateD4_s43",
-        "description": "LateD4 replicate with seed 43: after epoch 240, n_disc_updates_per_round drops from 5 to 4.",
+        "name": "P300_U220_L5e6_D230_Decay250",
+        "description": "U220_L5e6_D230 with safety grad scale decayed from 0.10 to 0.05 at epoch 250.",
         "env": {
-            "PROBE_SEED": "43",
-            "PROBE_LATE_N_DISC_EPOCH": "240",
-            "PROBE_LATE_N_DISC_UPDATES": "4",
+            "PROBE_SAFETY_UNFREEZE_TIMESTEPS": str(U220_TIMESTEPS),
+            "PROBE_SAFETY_LIGHT_UNFREEZE_LR": "5e-6",
+            "PROBE_SAFETY_DECAY_EPOCH": "250",
+            "PROBE_SAFETY_DECAY_LR": "2.5e-6",
         },
     },
     {
-        "name": "P300_S06_LateD4_s42",
-        "description": "LateD4 replicate with seed 42: after epoch 240, n_disc_updates_per_round drops from 5 to 4.",
+        "name": "P300_U220_L5e6_D230_Decay255",
+        "description": "U220_L5e6_D230 with safety grad scale decayed from 0.10 to 0.05 at epoch 255.",
         "env": {
-            "PROBE_SEED": "42",
-            "PROBE_LATE_N_DISC_EPOCH": "240",
-            "PROBE_LATE_N_DISC_UPDATES": "4",
-        },
-    },
-    {
-        "name": "P300_S06_LateD4_e230",
-        "description": "LateD4 timing probe on seed 44: after epoch 230, n_disc_updates_per_round drops from 5 to 4.",
-        "env": {
-            "PROBE_SEED": "44",
-            "PROBE_LATE_N_DISC_EPOCH": "230",
-            "PROBE_LATE_N_DISC_UPDATES": "4",
-        },
-    },
-    {
-        "name": "P300_S06_LateD4_e250",
-        "description": "LateD4 timing probe on seed 44: after epoch 250, n_disc_updates_per_round drops from 5 to 4.",
-        "env": {
-            "PROBE_SEED": "44",
-            "PROBE_LATE_N_DISC_EPOCH": "250",
-            "PROBE_LATE_N_DISC_UPDATES": "4",
+            "PROBE_SAFETY_UNFREEZE_TIMESTEPS": str(U220_TIMESTEPS),
+            "PROBE_SAFETY_LIGHT_UNFREEZE_LR": "5e-6",
+            "PROBE_SAFETY_DECAY_EPOCH": "255",
+            "PROBE_SAFETY_DECAY_LR": "2.5e-6",
         },
     },
 ]

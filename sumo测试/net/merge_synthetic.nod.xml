@@ -1,0 +1,7 @@
+<nodes>
+    <node id="main_start" x="0.00" y="0.00" type="priority"/>
+    <node id="merge_start" x="180.00" y="0.00" type="priority"/>
+    <node id="merge_end" x="320.00" y="0.00" type="priority"/>
+    <node id="main_end" x="600.00" y="0.00" type="priority"/>
+    <node id="ramp_start" x="110.00" y="-42.00" type="priority"/>
+</nodes>

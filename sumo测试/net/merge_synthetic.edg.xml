@@ -1,0 +1,6 @@
+<edges>
+    <edge id="main_in" from="main_start" to="merge_start" numLanes="2" speed="31.0" priority="3" width="3.6576"/>
+    <edge id="merge_zone" from="merge_start" to="merge_end" numLanes="3" speed="28.0" priority="3" width="3.6576"/>
+    <edge id="main_out" from="merge_end" to="main_end" numLanes="2" speed="31.0" priority="3" width="3.6576"/>
+    <edge id="ramp_in" from="ramp_start" to="merge_start" numLanes="1" speed="24.0" priority="2" width="3.6576"/>
+</edges>
