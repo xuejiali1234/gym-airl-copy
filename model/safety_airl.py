@@ -20,9 +20,18 @@ class MildSafetyAIRL(AIRL):
     transitions as expert-like.
     """
 
-    def __init__(self, *args, safety_loss_weight: float = 0.05, **kwargs):
+    def __init__(
+        self,
+        *args,
+        safety_loss_weight: float = 0.05,
+        safety_reg_mode: str = "legacy",
+        safety_reg_margin: float = 0.2,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.safety_loss_weight = float(safety_loss_weight)
+        self.safety_reg_mode = str(safety_reg_mode)
+        self.safety_reg_margin = float(safety_reg_margin)
 
     def _unwrap_reward_net(self):
         reward_net = self._reward_net
@@ -68,14 +77,36 @@ class MildSafetyAIRL(AIRL):
                     batch["labels_expert_is_one"].float(),
                 )
 
+                raw_reward = self._reward_net(
+                    batch["state"],
+                    batch["action"],
+                    batch["next_state"],
+                    batch["done"],
+                )
+
                 aux_loss = th.zeros((), device=disc_logits.device)
-                if self.safety_loss_weight > 0.0 and hasattr(base_reward_net, "disc_aux_safety_loss"):
-                    aux_loss = base_reward_net.disc_aux_safety_loss(
-                        batch["state"],
-                        batch["action"],
-                        disc_logits,
-                        batch["labels_expert_is_one"].float(),
-                    )
+                if self.safety_loss_weight > 0.0:
+                    if self.safety_reg_mode == "predictive_ranking" and hasattr(base_reward_net, "get_safety_debug"):
+                        safety_debug = base_reward_net.get_safety_debug(
+                            batch["state"],
+                            batch["action"],
+                        )
+                        q_risk = safety_debug["q_safe_risk"].squeeze(-1)
+                        safe_mask = q_risk < 0.2
+                        risky_mask = q_risk > 0.7
+                        if safe_mask.any() and risky_mask.any():
+                            aux_loss = th.relu(
+                                self.safety_reg_margin
+                                + raw_reward[risky_mask].mean()
+                                - raw_reward[safe_mask].mean()
+                            )
+                    elif hasattr(base_reward_net, "disc_aux_safety_loss"):
+                        aux_loss = base_reward_net.disc_aux_safety_loss(
+                            batch["state"],
+                            batch["action"],
+                            disc_logits,
+                            batch["labels_expert_is_one"].float(),
+                        )
 
                 reg_loss = self.safety_loss_weight * aux_loss
                 loss = bce_loss + reg_loss
@@ -93,12 +124,6 @@ class MildSafetyAIRL(AIRL):
                 last_total = loss.detach()
 
                 with th.no_grad():
-                    raw_reward = self._reward_net(
-                        batch["state"],
-                        batch["action"],
-                        batch["next_state"],
-                        batch["done"],
-                    )
                     labels = batch["labels_expert_is_one"].bool()
                     gen_labels = ~labels
                     if labels.any() and gen_labels.any():

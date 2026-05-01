@@ -26,35 +26,42 @@ CONTROL_ENV = {
     "PROBE_PPO_MINI_BATCH_SIZE": "256",
     "PROBE_GENERATOR_LR": "8e-5",
     "PROBE_DISCRIMINATOR_LR": "5e-5",
-    "PROBE_SAFETY_REG_COEFF": "0.06",
     "PROBE_N_DISC_UPDATES": "5",
     "PROBE_ENT_COEF": "0.005",
     "PROBE_REWARD_NORM": "0",
+    "PROBE_SAFETY_UNFREEZE_TIMESTEPS": str(U220_TIMESTEPS),
+    "PROBE_SAFETY_LIGHT_UNFREEZE_LR": "5e-6",
     "PROBE_LATE_N_DISC_EPOCH": "230",
     "PROBE_LATE_N_DISC_UPDATES": "4",
     "PROBE_SAFETY_FUSE_FEATURE": "0",
     "PROBE_SAFETY_EMBED_DIM": "1",
+    "PROBE_ENABLE_PREDICTIVE_SAFETY_CRITIC": "1",
+    "PROBE_PREDICTIVE_SAFETY_HORIZON_STEPS": "10",
+    "PROBE_PREDICTIVE_SAFETY_DT": "0.1",
+    "PROBE_PREDICTIVE_SAFETY_USE_CANDIDATES": "1",
+    "PROBE_PREDICTIVE_SAFETY_GEN_PENALTY": "0.0",
 }
 
 EXPERIMENTS = [
     {
-        "name": "P300_U220_L5e6_D230_Decay250",
-        "description": "U220_L5e6_D230 with safety grad scale decayed from 0.10 to 0.05 at epoch 250.",
+        "name": "P300_U220_D230_P1_PSC_Scalar",
+        "description": "Predictive safety scalar only on the U220_D230 training base.",
         "env": {
-            "PROBE_SAFETY_UNFREEZE_TIMESTEPS": str(U220_TIMESTEPS),
-            "PROBE_SAFETY_LIGHT_UNFREEZE_LR": "5e-6",
-            "PROBE_SAFETY_DECAY_EPOCH": "250",
-            "PROBE_SAFETY_DECAY_LR": "2.5e-6",
+            "PROBE_PREDICTIVE_SAFETY_REG_COEFF": "0.0",
         },
     },
     {
-        "name": "P300_U220_L5e6_D230_Decay255",
-        "description": "U220_L5e6_D230 with safety grad scale decayed from 0.10 to 0.05 at epoch 255.",
+        "name": "P300_U220_D230_P2_PSC_Reg003",
+        "description": "Predictive safety scalar with weak discriminator ranking regulator (0.03).",
         "env": {
-            "PROBE_SAFETY_UNFREEZE_TIMESTEPS": str(U220_TIMESTEPS),
-            "PROBE_SAFETY_LIGHT_UNFREEZE_LR": "5e-6",
-            "PROBE_SAFETY_DECAY_EPOCH": "255",
-            "PROBE_SAFETY_DECAY_LR": "2.5e-6",
+            "PROBE_PREDICTIVE_SAFETY_REG_COEFF": "0.03",
+        },
+    },
+    {
+        "name": "P300_U220_D230_P3_PSC_Reg006",
+        "description": "Predictive safety scalar with normal discriminator ranking regulator (0.06).",
+        "env": {
+            "PROBE_PREDICTIVE_SAFETY_REG_COEFF": "0.06",
         },
     },
 ]

@@ -36,8 +36,10 @@ from model.attention_net import (
     GoalRewardWrapper,
 )
 from model.safety_q_module import SafetyQNetwork, ZeroSafetyQNetwork, SafeQAttentionRewardNet, SafeQMLPRewardNet
+from model.predictive_safety_cost import PredictiveSafetyCostNetwork
+from model.predictive_safety_oracle import PredictiveSafetyOracle
 from model.safety_oracle_q import SafetyOracleQ
-from model.safety_pretrain_q import pretrain_safety_q_network
+from model.safety_pretrain_q import pretrain_safety_q_network, pretrain_predictive_safety_network
 from model.safety_airl import MildSafetyAIRL
 
 
@@ -287,6 +289,10 @@ def apply_probe_overrides(cfg):
     set_if_present("PROBE_SAFETY_ORACLE_WARNING_TTC_THRESHOLD", "SAFETY_ORACLE_WARNING_TTC_THRESHOLD", float)
     set_if_present("PROBE_SAFETY_ORACLE_WARNING_WEIGHT", "SAFETY_ORACLE_WARNING_WEIGHT", float)
     set_if_present("PROBE_SAFETY_REG_COEFF", "SAFETY_REGULATOR_COEFF", float)
+    set_if_present("PROBE_PREDICTIVE_SAFETY_HORIZON_STEPS", "PREDICTIVE_SAFETY_HORIZON_STEPS", int)
+    set_if_present("PROBE_PREDICTIVE_SAFETY_DT", "PREDICTIVE_SAFETY_DT", float)
+    set_if_present("PROBE_PREDICTIVE_SAFETY_REG_COEFF", "PREDICTIVE_SAFETY_REG_COEFF", float)
+    set_if_present("PROBE_PREDICTIVE_SAFETY_GEN_PENALTY", "PREDICTIVE_SAFETY_GEN_PENALTY", float)
     set_if_present("PROBE_ENT_COEF", "PPO_ENT_COEF", float)
     set_if_present("PROBE_SAVE_FREQ_EPOCHS", "PROBE_SAVE_FREQ_EPOCHS", int)
     set_if_present("PROBE_QUICK_EVAL_EPISODES", "PROBE_QUICK_EVAL_EPISODES", int)
@@ -302,6 +308,16 @@ def apply_probe_overrides(cfg):
     if safety_fuse_feature is not None:
         cfg.SAFETY_FUSE_FEATURE = safety_fuse_feature
         overrides["SAFETY_FUSE_FEATURE"] = safety_fuse_feature
+
+    predictive_safety = parse_env_bool("PROBE_ENABLE_PREDICTIVE_SAFETY_CRITIC")
+    if predictive_safety is not None:
+        cfg.ENABLE_PREDICTIVE_SAFETY_CRITIC = predictive_safety
+        overrides["ENABLE_PREDICTIVE_SAFETY_CRITIC"] = predictive_safety
+
+    predictive_candidates = parse_env_bool("PROBE_PREDICTIVE_SAFETY_USE_CANDIDATES")
+    if predictive_candidates is not None:
+        cfg.PREDICTIVE_SAFETY_USE_CANDIDATES = predictive_candidates
+        overrides["PREDICTIVE_SAFETY_USE_CANDIDATES"] = predictive_candidates
 
     return overrides
 
@@ -321,10 +337,16 @@ def main():
     enable_safety = getattr(cfg, "ENABLE_SAFETY_MODULE", False)
     enable_safety_branch = enable_safety and getattr(cfg, "ENABLE_SAFETY_BRANCH", True)
     enable_safety_aux = enable_safety and getattr(cfg, "ENABLE_SAFETY_AUX_LOSS", True)
+    enable_predictive_safety = enable_safety_branch and getattr(cfg, "ENABLE_PREDICTIVE_SAFETY_CRITIC", False)
     enable_reward_norm = getattr(cfg, "ENABLE_REWARD_NORMALIZATION", False)
     debug_use_ground_truth_reward = getattr(cfg, "DEBUG_USE_GROUND_TRUTH_REWARD", False)
     safety_fuse_feature = enable_safety and getattr(cfg, "SAFETY_FUSE_FEATURE", False)
     safety_embed_dim = int(getattr(cfg, "SAFETY_EMBED_DIM", 8 if safety_fuse_feature else 1))
+    predictive_safety_horizon_steps = int(getattr(cfg, "PREDICTIVE_SAFETY_HORIZON_STEPS", 10))
+    predictive_safety_dt = float(getattr(cfg, "PREDICTIVE_SAFETY_DT", cfg.DT))
+    predictive_safety_use_candidates = bool(getattr(cfg, "PREDICTIVE_SAFETY_USE_CANDIDATES", True))
+    predictive_safety_reg_coeff = float(getattr(cfg, "PREDICTIVE_SAFETY_REG_COEFF", 0.0))
+    predictive_safety_reg_margin = float(getattr(cfg, "PREDICTIVE_SAFETY_REG_MARGIN", 0.2))
     
     # ==========================================
     # 1. 文件夹与日志系统初始化
@@ -373,6 +395,12 @@ def main():
             f"aux_loss={enable_safety_aux}, "
             f"reg_weight={getattr(cfg, 'SAFETY_REGULATOR_COEFF', 0.0) if enable_safety_aux else 0.0})"
         )
+        if enable_predictive_safety:
+            print(
+                "[*] Predictive safety critic enabled "
+                f"(horizon_steps={predictive_safety_horizon_steps}, dt={predictive_safety_dt}, "
+                f"candidates={predictive_safety_use_candidates}, reg_coeff={predictive_safety_reg_coeff})"
+            )
     else:
         print("[*] 当前安全模块: 关闭")
 
@@ -401,25 +429,52 @@ def main():
     if enable_safety:
         if enable_safety_branch:
             print("[*] 正在预训练安全网络...")
-            safety_oracle = SafetyOracleQ(cfg, train_dataset.expert_mean, train_dataset.expert_std)
-            safety_net = SafetyQNetwork(
-                state_dim=16,
-                action_dim=2,
-                hidden_dim=128,
-                use_action=getattr(cfg, "SAFETY_USE_ACTION", True),
-            )
-            pretrain_stats = pretrain_safety_q_network(
-                safety_net,
-                train_dataset,
-                safety_oracle,
-                device=device,
-                epochs=15,
-                batch_size=512,
-                lr=cfg.SAFETY_LEARNING_RATE,
-                synthetic_multiplier=1.0,
-                seed=cfg.SEED,
-                verbose=True,
-            )
+            if enable_predictive_safety:
+                safety_oracle = PredictiveSafetyOracle(
+                    cfg,
+                    train_dataset.expert_mean,
+                    train_dataset.expert_std,
+                    horizon_steps=predictive_safety_horizon_steps,
+                    dt=predictive_safety_dt,
+                )
+                safety_net = PredictiveSafetyCostNetwork(
+                    state_dim=16,
+                    action_dim=2,
+                    hidden_dim=128,
+                    use_action=getattr(cfg, "SAFETY_USE_ACTION", True),
+                )
+                pretrain_stats = pretrain_predictive_safety_network(
+                    safety_net,
+                    train_dataset,
+                    safety_oracle,
+                    device=device,
+                    epochs=15,
+                    batch_size=512,
+                    lr=cfg.SAFETY_LEARNING_RATE,
+                    use_candidates=predictive_safety_use_candidates,
+                    seed=cfg.SEED,
+                    verbose=True,
+                )
+            else:
+                safety_oracle = SafetyOracleQ(cfg, train_dataset.expert_mean, train_dataset.expert_std)
+                safety_net = SafetyQNetwork(
+                    state_dim=16,
+                    action_dim=2,
+                    hidden_dim=128,
+                    use_action=getattr(cfg, "SAFETY_USE_ACTION", True),
+                )
+                pretrain_stats = pretrain_safety_q_network(
+                    safety_net,
+                    train_dataset,
+                    safety_oracle,
+                    device=device,
+                    epochs=15,
+                    batch_size=512,
+                    lr=cfg.SAFETY_LEARNING_RATE,
+                    synthetic_multiplier=1.0,
+                    seed=cfg.SEED,
+                    verbose=True,
+                )
             print(f"[*] Safety pretrain done: {pretrain_stats}")
         else:
             print("[*] 安全先验分支消融: 使用恒零安全网络，跳过安全预训练。")
@@ -577,9 +632,19 @@ def main():
         ),
     )
     if enable_safety:
+        safety_loss_weight = 0.0
+        safety_reg_mode = "legacy"
+        if enable_safety_aux:
+            if enable_predictive_safety:
+                safety_loss_weight = predictive_safety_reg_coeff
+                safety_reg_mode = "predictive_ranking"
+            else:
+                safety_loss_weight = cfg.SAFETY_REGULATOR_COEFF
         airl_trainer = MildSafetyAIRL(
             **trainer_kwargs,
-            safety_loss_weight=cfg.SAFETY_REGULATOR_COEFF if enable_safety_aux else 0.0,
+            safety_loss_weight=safety_loss_weight,
+            safety_reg_mode=safety_reg_mode,
+            safety_reg_margin=predictive_safety_reg_margin,
         )
     else:
         airl_trainer = AIRL(**trainer_kwargs)
@@ -657,9 +722,14 @@ def main():
                 "safety_enabled": enable_safety,
                 "safety_branch_enabled": enable_safety_branch,
                 "safety_aux_enabled": enable_safety_aux,
+                "predictive_safety_enabled": enable_predictive_safety,
                 "safety_fusion_effective": "feature_fusion" if safety_fuse_feature else ("scalar_only" if enable_safety else "disabled"),
                 "safety_embed_dim": safety_embed_dim if enable_safety else 0,
-                "safety_loss_weight_effective": cfg.SAFETY_REGULATOR_COEFF if enable_safety_aux else 0.0,
+                "safety_loss_weight_effective": (
+                    predictive_safety_reg_coeff
+                    if (enable_safety_aux and enable_predictive_safety)
+                    else (cfg.SAFETY_REGULATOR_COEFF if enable_safety_aux else 0.0)
+                ),
                 "reward_normalization_enabled": enable_reward_norm,
                 "reward_normalization_layer": "RunningNorm" if enable_reward_norm else "disabled",
                 "debug_use_ground_truth_reward": debug_use_ground_truth_reward,
@@ -675,7 +745,7 @@ def main():
         },
     )
 
-    if enable_safety and hasattr(base_reward_net, "set_safety_training_phase"):
+    if enable_safety and hasattr(base_reward_net, "set_safety_training_phase") and not enable_predictive_safety:
         base_reward_net.set_safety_training_phase("frozen")
         if safety_unfreeze_timesteps > total_train_timesteps:
             print(
@@ -709,6 +779,7 @@ def main():
         if not (
             enable_safety
             and hasattr(base_reward_net, "set_safety_training_phase")
+            and not enable_predictive_safety
             and safety_unfreeze_timesteps <= total_train_timesteps
         ):
             return
