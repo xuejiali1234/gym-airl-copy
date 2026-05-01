@@ -166,20 +166,28 @@ class _SafetyFusionMixin:
 
     def _init_safety(
         self,
-        safety_net: SafetyQNetwork,
+        safety_net: nn.Module,
         *,
         safety_embed_dim: int = 32,
         freeze_safety: bool = True,
         fuse_safety_feature: bool = True,
+        predictive_safety_net: Optional[nn.Module] = None,
+        predictive_residual_scale: float = 0.0,
+        freeze_predictive_safety: bool = True,
     ) -> None:
         self.core_state_dim = 16
         self.safety_net = safety_net
         self.freeze_safety = bool(freeze_safety)
         self.fuse_safety_feature = bool(fuse_safety_feature)
         self.safety_embed_dim = 1 if not self.fuse_safety_feature else int(safety_embed_dim)
+        self.predictive_safety_net = predictive_safety_net
+        self.predictive_residual_scale = float(predictive_residual_scale)
+        self.freeze_predictive_safety = bool(freeze_predictive_safety)
 
         if self.freeze_safety:
             freeze_module(self.safety_net)
+        if self.predictive_safety_net is not None and self.freeze_predictive_safety:
+            freeze_module(self.predictive_safety_net)
 
         safety_input_dim = 1
         if self.fuse_safety_feature:
@@ -206,6 +214,17 @@ class _SafetyFusionMixin:
         else:
             q_logit, q_feat = self.safety_net(core_state, safety_action, return_feature=True)
         q_risk = torch.sigmoid(q_logit)
+
+        if self.predictive_safety_net is not None and self.predictive_residual_scale > 0.0:
+            predictive_action = action if self.predictive_safety_net.use_action else None
+            if self.freeze_predictive_safety:
+                with torch.no_grad():
+                    pred_logit, _ = self.predictive_safety_net(core_state, predictive_action, return_feature=True)
+            else:
+                pred_logit, _ = self.predictive_safety_net(core_state, predictive_action, return_feature=True)
+            pred_risk = torch.sigmoid(pred_logit)
+            q_risk = torch.maximum(q_risk, pred_risk * self.predictive_residual_scale)
+            q_logit = torch.logit(q_risk.clamp(1e-4, 1.0 - 1e-4))
         return q_logit, q_risk, q_feat
 
     def _get_safety_embedding(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
@@ -252,11 +271,37 @@ class _SafetyFusionMixin:
         return aux
 
     def get_safety_debug(self, state: torch.Tensor, action: torch.Tensor) -> dict[str, torch.Tensor]:
+        core_state = state[..., : self.core_state_dim]
+        safety_action = action if self.safety_net.use_action else None
+        if self.freeze_safety:
+            with torch.no_grad():
+                base_q_logit, _ = self.safety_net(core_state, safety_action, return_feature=True)
+        else:
+            base_q_logit, _ = self.safety_net(core_state, safety_action, return_feature=True)
+        base_q_risk = torch.sigmoid(base_q_logit)
+
+        pred_q_logit = None
+        pred_q_risk = None
+        if self.predictive_safety_net is not None and self.predictive_residual_scale > 0.0:
+            predictive_action = action if self.predictive_safety_net.use_action else None
+            if self.freeze_predictive_safety:
+                with torch.no_grad():
+                    pred_q_logit, _ = self.predictive_safety_net(core_state, predictive_action, return_feature=True)
+            else:
+                pred_q_logit, _ = self.predictive_safety_net(core_state, predictive_action, return_feature=True)
+            pred_q_risk = torch.sigmoid(pred_q_logit)
+
         q_logit, q_risk, _ = self._get_safety_outputs(state, action)
-        return {
+        debug = {
             "q_safe_logit": q_logit.detach(),
             "q_safe_risk": q_risk.detach(),
+            "q_safe_base_logit": base_q_logit.detach(),
+            "q_safe_base_risk": base_q_risk.detach(),
         }
+        if pred_q_logit is not None and pred_q_risk is not None:
+            debug["q_safe_predictive_logit"] = pred_q_logit.detach()
+            debug["q_safe_predictive_risk"] = pred_q_risk.detach()
+        return debug
 
 
 class SafeQAttentionRewardNet(_SafetyFusionMixin, RewardNet):
@@ -281,6 +326,9 @@ class SafeQAttentionRewardNet(_SafetyFusionMixin, RewardNet):
         safety_embed_dim: int = 32,
         freeze_safety: bool = True,
         fuse_safety_feature: bool = True,
+        predictive_safety_net: Optional[nn.Module] = None,
+        predictive_residual_scale: float = 0.0,
+        freeze_predictive_safety: bool = True,
     ) -> None:
         super().__init__(observation_space, action_space)
         obs_dim = observation_space.shape[0]
@@ -302,6 +350,9 @@ class SafeQAttentionRewardNet(_SafetyFusionMixin, RewardNet):
             safety_embed_dim=safety_embed_dim,
             freeze_safety=freeze_safety,
             fuse_safety_feature=fuse_safety_feature,
+            predictive_safety_net=predictive_safety_net,
+            predictive_residual_scale=predictive_residual_scale,
+            freeze_predictive_safety=freeze_predictive_safety,
         )
 
         self.head = nn.Sequential(
@@ -331,6 +382,9 @@ class SafeQMLPRewardNet(_SafetyFusionMixin, RewardNet):
         safety_embed_dim: int = 32,
         freeze_safety: bool = True,
         fuse_safety_feature: bool = True,
+        predictive_safety_net: Optional[nn.Module] = None,
+        predictive_residual_scale: float = 0.0,
+        freeze_predictive_safety: bool = True,
     ) -> None:
         super().__init__(observation_space, action_space)
         obs_dim = observation_space.shape[0]
@@ -348,6 +402,9 @@ class SafeQMLPRewardNet(_SafetyFusionMixin, RewardNet):
             safety_embed_dim=safety_embed_dim,
             freeze_safety=freeze_safety,
             fuse_safety_feature=fuse_safety_feature,
+            predictive_safety_net=predictive_safety_net,
+            predictive_residual_scale=predictive_residual_scale,
+            freeze_predictive_safety=freeze_predictive_safety,
         )
 
         self.head = nn.Sequential(

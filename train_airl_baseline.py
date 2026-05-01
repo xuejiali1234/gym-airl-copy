@@ -291,8 +291,17 @@ def apply_probe_overrides(cfg):
     set_if_present("PROBE_SAFETY_REG_COEFF", "SAFETY_REGULATOR_COEFF", float)
     set_if_present("PROBE_PREDICTIVE_SAFETY_HORIZON_STEPS", "PREDICTIVE_SAFETY_HORIZON_STEPS", int)
     set_if_present("PROBE_PREDICTIVE_SAFETY_DT", "PREDICTIVE_SAFETY_DT", float)
+    set_if_present("PROBE_PREDICTIVE_SAFETY_RESIDUAL_SCALE", "PREDICTIVE_SAFETY_RESIDUAL_SCALE", float)
     set_if_present("PROBE_PREDICTIVE_SAFETY_REG_COEFF", "PREDICTIVE_SAFETY_REG_COEFF", float)
     set_if_present("PROBE_PREDICTIVE_SAFETY_GEN_PENALTY", "PREDICTIVE_SAFETY_GEN_PENALTY", float)
+    predictive_residual = parse_env_bool("PROBE_ENABLE_PREDICTIVE_SAFETY_RESIDUAL")
+    if predictive_residual is not None:
+        cfg.ENABLE_PREDICTIVE_SAFETY_RESIDUAL = predictive_residual
+        overrides["ENABLE_PREDICTIVE_SAFETY_RESIDUAL"] = predictive_residual
+    predictive_reg_mode = os.environ.get("PROBE_PREDICTIVE_SAFETY_REG_MODE")
+    if predictive_reg_mode:
+        cfg.PREDICTIVE_SAFETY_REG_MODE = predictive_reg_mode
+        overrides["PREDICTIVE_SAFETY_REG_MODE"] = predictive_reg_mode
     set_if_present("PROBE_ENT_COEF", "PPO_ENT_COEF", float)
     set_if_present("PROBE_SAVE_FREQ_EPOCHS", "PROBE_SAVE_FREQ_EPOCHS", int)
     set_if_present("PROBE_QUICK_EVAL_EPISODES", "PROBE_QUICK_EVAL_EPISODES", int)
@@ -338,6 +347,9 @@ def main():
     enable_safety_branch = enable_safety and getattr(cfg, "ENABLE_SAFETY_BRANCH", True)
     enable_safety_aux = enable_safety and getattr(cfg, "ENABLE_SAFETY_AUX_LOSS", True)
     enable_predictive_safety = enable_safety_branch and getattr(cfg, "ENABLE_PREDICTIVE_SAFETY_CRITIC", False)
+    enable_predictive_safety_residual = enable_safety_branch and getattr(cfg, "ENABLE_PREDICTIVE_SAFETY_RESIDUAL", False)
+    predictive_replaces_safety = enable_predictive_safety and not enable_predictive_safety_residual
+    use_predictive_safety = enable_predictive_safety or enable_predictive_safety_residual
     enable_reward_norm = getattr(cfg, "ENABLE_REWARD_NORMALIZATION", False)
     debug_use_ground_truth_reward = getattr(cfg, "DEBUG_USE_GROUND_TRUTH_REWARD", False)
     safety_fuse_feature = enable_safety and getattr(cfg, "SAFETY_FUSE_FEATURE", False)
@@ -345,7 +357,9 @@ def main():
     predictive_safety_horizon_steps = int(getattr(cfg, "PREDICTIVE_SAFETY_HORIZON_STEPS", 10))
     predictive_safety_dt = float(getattr(cfg, "PREDICTIVE_SAFETY_DT", cfg.DT))
     predictive_safety_use_candidates = bool(getattr(cfg, "PREDICTIVE_SAFETY_USE_CANDIDATES", True))
+    predictive_safety_residual_scale = float(getattr(cfg, "PREDICTIVE_SAFETY_RESIDUAL_SCALE", 0.3))
     predictive_safety_reg_coeff = float(getattr(cfg, "PREDICTIVE_SAFETY_REG_COEFF", 0.0))
+    predictive_safety_reg_mode = str(getattr(cfg, "PREDICTIVE_SAFETY_REG_MODE", "candidate_pair_ranking"))
     predictive_safety_reg_margin = float(getattr(cfg, "PREDICTIVE_SAFETY_REG_MARGIN", 0.2))
     
     # ==========================================
@@ -395,11 +409,19 @@ def main():
             f"aux_loss={enable_safety_aux}, "
             f"reg_weight={getattr(cfg, 'SAFETY_REGULATOR_COEFF', 0.0) if enable_safety_aux else 0.0})"
         )
-        if enable_predictive_safety:
+        if predictive_replaces_safety:
             print(
                 "[*] Predictive safety critic enabled "
                 f"(horizon_steps={predictive_safety_horizon_steps}, dt={predictive_safety_dt}, "
-                f"candidates={predictive_safety_use_candidates}, reg_coeff={predictive_safety_reg_coeff})"
+                f"candidates={predictive_safety_use_candidates}, reg_coeff={predictive_safety_reg_coeff}, "
+                f"reg_mode={predictive_safety_reg_mode})"
+            )
+        elif enable_predictive_safety_residual:
+            print(
+                "[*] Predictive safety residual enabled "
+                f"(scale={predictive_safety_residual_scale}, horizon_steps={predictive_safety_horizon_steps}, "
+                f"dt={predictive_safety_dt}, candidates={predictive_safety_use_candidates}, "
+                f"reg_coeff={predictive_safety_reg_coeff}, reg_mode={predictive_safety_reg_mode})"
             )
     else:
         print("[*] 当前安全模块: 关闭")
@@ -426,10 +448,11 @@ def main():
     expert_trajectories = convert_to_trajectories(train_dataset, cfg)
 
     safety_net = None
+    predictive_safety_net = None
     if enable_safety:
         if enable_safety_branch:
             print("[*] 正在预训练安全网络...")
-            if enable_predictive_safety:
+            if predictive_replaces_safety:
                 safety_oracle = PredictiveSafetyOracle(
                     cfg,
                     train_dataset.expert_mean,
@@ -475,6 +498,34 @@ def main():
                     seed=cfg.SEED,
                     verbose=True,
                 )
+                if enable_predictive_safety_residual:
+                    print("[*] 正在预训练 predictive residual 安全网络...")
+                    predictive_safety_oracle = PredictiveSafetyOracle(
+                        cfg,
+                        train_dataset.expert_mean,
+                        train_dataset.expert_std,
+                        horizon_steps=predictive_safety_horizon_steps,
+                        dt=predictive_safety_dt,
+                    )
+                    predictive_safety_net = PredictiveSafetyCostNetwork(
+                        state_dim=16,
+                        action_dim=2,
+                        hidden_dim=128,
+                        use_action=getattr(cfg, "SAFETY_USE_ACTION", True),
+                    )
+                    predictive_pretrain_stats = pretrain_predictive_safety_network(
+                        predictive_safety_net,
+                        train_dataset,
+                        predictive_safety_oracle,
+                        device=device,
+                        epochs=15,
+                        batch_size=512,
+                        lr=cfg.SAFETY_LEARNING_RATE,
+                        use_candidates=predictive_safety_use_candidates,
+                        seed=cfg.SEED,
+                        verbose=True,
+                    )
+                    print(f"[*] Predictive residual pretrain done: {predictive_pretrain_stats}")
             print(f"[*] Safety pretrain done: {pretrain_stats}")
         else:
             print("[*] 安全先验分支消融: 使用恒零安全网络，跳过安全预训练。")
@@ -520,6 +571,9 @@ def main():
                 safety_embed_dim=safety_embed_dim,
                 freeze_safety=True,
                 fuse_safety_feature=safety_fuse_feature,
+                predictive_safety_net=predictive_safety_net,
+                predictive_residual_scale=predictive_safety_residual_scale if enable_predictive_safety_residual else 0.0,
+                freeze_predictive_safety=True,
             )
         else:
             base_reward_net = AttentionRewardNet(
@@ -557,6 +611,9 @@ def main():
                 safety_embed_dim=safety_embed_dim,
                 freeze_safety=True,
                 fuse_safety_feature=safety_fuse_feature,
+                predictive_safety_net=predictive_safety_net,
+                predictive_residual_scale=predictive_safety_residual_scale if enable_predictive_safety_residual else 0.0,
+                freeze_predictive_safety=True,
             )
         else:
             base_reward_net = BasicRewardNet(
@@ -637,7 +694,7 @@ def main():
         if enable_safety_aux:
             if enable_predictive_safety:
                 safety_loss_weight = predictive_safety_reg_coeff
-                safety_reg_mode = "predictive_ranking"
+                safety_reg_mode = predictive_safety_reg_mode
             else:
                 safety_loss_weight = cfg.SAFETY_REGULATOR_COEFF
         airl_trainer = MildSafetyAIRL(
@@ -722,7 +779,11 @@ def main():
                 "safety_enabled": enable_safety,
                 "safety_branch_enabled": enable_safety_branch,
                 "safety_aux_enabled": enable_safety_aux,
-                "predictive_safety_enabled": enable_predictive_safety,
+                "predictive_safety_enabled": use_predictive_safety,
+                "predictive_safety_replaces_safety": predictive_replaces_safety,
+                "predictive_safety_residual_enabled": enable_predictive_safety_residual,
+                "predictive_safety_residual_scale": predictive_safety_residual_scale if enable_predictive_safety_residual else 0.0,
+                "predictive_safety_reg_mode": predictive_safety_reg_mode,
                 "safety_fusion_effective": "feature_fusion" if safety_fuse_feature else ("scalar_only" if enable_safety else "disabled"),
                 "safety_embed_dim": safety_embed_dim if enable_safety else 0,
                 "safety_loss_weight_effective": (
@@ -745,7 +806,7 @@ def main():
         },
     )
 
-    if enable_safety and hasattr(base_reward_net, "set_safety_training_phase") and not enable_predictive_safety:
+    if enable_safety and hasattr(base_reward_net, "set_safety_training_phase") and not predictive_replaces_safety:
         base_reward_net.set_safety_training_phase("frozen")
         if safety_unfreeze_timesteps > total_train_timesteps:
             print(
@@ -779,7 +840,7 @@ def main():
         if not (
             enable_safety
             and hasattr(base_reward_net, "set_safety_training_phase")
-            and not enable_predictive_safety
+            and not predictive_replaces_safety
             and safety_unfreeze_timesteps <= total_train_timesteps
         ):
             return

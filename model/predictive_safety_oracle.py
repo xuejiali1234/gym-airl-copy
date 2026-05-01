@@ -38,12 +38,33 @@ class PredictiveSafetyOracle:
         self.thw_follow_threshold = float(thw_follow_threshold)
         self.gap_lead_threshold = float(gap_lead_threshold)
         self.gap_follow_threshold = float(gap_follow_threshold)
+        self.gap_lead_tau = float(getattr(cfg, "PREDICTIVE_GAP_LEAD_TAU", 0.7))
+        self.gap_follow_tau = float(getattr(cfg, "PREDICTIVE_GAP_FOLLOW_TAU", 0.5))
+        self.merge_intent_norm_threshold = float(
+            getattr(cfg, "PREDICTIVE_MERGE_INTENT_NORM_THRESHOLD", -0.05)
+        )
+        self.target_lane_activation_slack = float(
+            getattr(cfg, "PREDICTIVE_TARGET_LANE_ACTIVATION_SLACK", 6.0)
+        )
+        self.target_lane_background_weight = float(
+            getattr(cfg, "PREDICTIVE_TARGET_LANE_BACKGROUND_WEIGHT", 0.3)
+        )
+        self.target_ttc_thw_weight = float(
+            getattr(cfg, "PREDICTIVE_TARGET_TTC_THW_WEIGHT", 0.6)
+        )
+        self.target_gap_weight = float(
+            getattr(cfg, "PREDICTIVE_TARGET_GAP_WEIGHT", 0.3)
+        )
+        self.current_lane_risk_weight = float(
+            getattr(cfg, "PREDICTIVE_CURRENT_LANE_RISK_WEIGHT", 0.2)
+        )
 
         self.vehicle_w = float(cfg.VEHICLE_WIDTH)
         self.vehicle_l = float(cfg.VEHICLE_LENGTH)
         self.phys_acc_max = float(cfg.PHYS_ACC_MAX)
         self.phys_steer_max = float(cfg.PHYS_STEER_MAX)
         self.speed_limit = float(getattr(cfg, "SPEED_LIMIT", 80.0))
+        self.lane_divider_x = float(cfg.X_MIN + cfg.LANE_WIDTH)
 
     def _denormalize_state(self, states_tensor: torch.Tensor) -> torch.Tensor:
         core_state = states_tensor[..., :16]
@@ -156,7 +177,10 @@ class PredictiveSafetyOracle:
         }
 
     @staticmethod
-    def _risk_from_threshold(values: torch.Tensor, threshold: float) -> torch.Tensor:
+    def _risk_from_threshold(values: torch.Tensor, threshold: float | torch.Tensor) -> torch.Tensor:
+        if torch.is_tensor(threshold):
+            safe_threshold = torch.clamp(threshold, min=1e-6)
+            return torch.clamp((safe_threshold - values) / safe_threshold, min=0.0, max=1.0)
         threshold = float(threshold)
         return torch.clamp((threshold - values) / max(threshold, 1e-6), min=0.0, max=1.0)
 
@@ -177,6 +201,15 @@ class PredictiveSafetyOracle:
         min_thw_follow = inf.clone()
         min_gap_lead = inf.clone()
         min_gap_follow = inf.clone()
+        min_ttc_current_lead = inf.clone()
+        min_ttc_target_lead = inf.clone()
+        min_ttc_target_follow = inf.clone()
+        min_thw_current_lead = inf.clone()
+        min_thw_target_lead = inf.clone()
+        min_thw_target_follow = inf.clone()
+        min_gap_current_lead = inf.clone()
+        min_gap_target_lead = inf.clone()
+        min_gap_target_follow = inf.clone()
         future_overlap = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         rollout_states = raw_states
@@ -191,6 +224,15 @@ class PredictiveSafetyOracle:
             min_thw_follow = torch.minimum(min_thw_follow, follow_l5["thw"])
             min_gap_lead = torch.minimum(min_gap_lead, torch.minimum(lead_l6["gap"], lead_l5["gap"]))
             min_gap_follow = torch.minimum(min_gap_follow, follow_l5["gap"])
+            min_ttc_current_lead = torch.minimum(min_ttc_current_lead, lead_l6["ttc"])
+            min_ttc_target_lead = torch.minimum(min_ttc_target_lead, lead_l5["ttc"])
+            min_ttc_target_follow = torch.minimum(min_ttc_target_follow, follow_l5["ttc"])
+            min_thw_current_lead = torch.minimum(min_thw_current_lead, lead_l6["thw"])
+            min_thw_target_lead = torch.minimum(min_thw_target_lead, lead_l5["thw"])
+            min_thw_target_follow = torch.minimum(min_thw_target_follow, follow_l5["thw"])
+            min_gap_current_lead = torch.minimum(min_gap_current_lead, lead_l6["gap"])
+            min_gap_target_lead = torch.minimum(min_gap_target_lead, lead_l5["gap"])
+            min_gap_target_follow = torch.minimum(min_gap_target_follow, follow_l5["gap"])
             future_overlap = future_overlap | lead_l6["overlap"] | lead_l5["overlap"] | follow_l5["overlap"]
 
             rollout_states = self._rollout_one_step(rollout_states, raw_actions)
@@ -200,14 +242,47 @@ class PredictiveSafetyOracle:
         ttc_follow_risk = self._risk_from_threshold(min_ttc_follow, self.ttc_follow_threshold)
         thw_lead_risk = self._risk_from_threshold(min_thw_lead, self.thw_lead_threshold)
         thw_follow_risk = self._risk_from_threshold(min_thw_follow, self.thw_follow_threshold)
-        gap_lead_risk = self._risk_from_threshold(min_gap_lead, self.gap_lead_threshold)
-        gap_follow_risk = self._risk_from_threshold(min_gap_follow, self.gap_follow_threshold)
+        ego_speed_y = torch.clamp(raw_states[:, 3], min=0.0)
+        dynamic_gap_lead_threshold = self.vehicle_l + self.gap_lead_tau * ego_speed_y
+        dynamic_gap_follow_threshold = self.vehicle_l + self.gap_follow_tau * ego_speed_y
+        gap_lead_risk = self._risk_from_threshold(min_gap_lead, dynamic_gap_lead_threshold)
+        gap_follow_risk = self._risk_from_threshold(min_gap_follow, dynamic_gap_follow_threshold)
+
+        ttc_current_lead_risk = self._risk_from_threshold(min_ttc_current_lead, self.ttc_lead_threshold)
+        ttc_target_lead_risk = self._risk_from_threshold(min_ttc_target_lead, self.ttc_lead_threshold)
+        ttc_target_follow_risk = self._risk_from_threshold(min_ttc_target_follow, self.ttc_follow_threshold)
+        thw_current_lead_risk = self._risk_from_threshold(min_thw_current_lead, self.thw_lead_threshold)
+        thw_target_lead_risk = self._risk_from_threshold(min_thw_target_lead, self.thw_lead_threshold)
+        thw_target_follow_risk = self._risk_from_threshold(min_thw_target_follow, self.thw_follow_threshold)
+        gap_current_lead_risk = self._risk_from_threshold(min_gap_current_lead, dynamic_gap_lead_threshold)
+        gap_target_lead_risk = self._risk_from_threshold(min_gap_target_lead, dynamic_gap_lead_threshold)
+        gap_target_follow_risk = self._risk_from_threshold(min_gap_target_follow, dynamic_gap_follow_threshold)
+
+        merge_intent = raw_actions[:, 0] <= (self.merge_intent_norm_threshold * self.phys_steer_max)
+        near_merge_zone = raw_states[:, 0] <= (self.lane_divider_x + self.target_lane_activation_slack)
+        target_lane_active = merge_intent | near_merge_zone
+        target_lane_scale = torch.where(
+            target_lane_active,
+            torch.ones_like(overlap_risk),
+            torch.full_like(overlap_risk, self.target_lane_background_weight),
+        )
+
+        target_ttc_risk = torch.maximum(ttc_target_lead_risk, ttc_target_follow_risk)
+        target_thw_risk = torch.maximum(thw_target_lead_risk, thw_target_follow_risk)
+        target_gap_risk = torch.maximum(gap_target_lead_risk, gap_target_follow_risk)
+        current_lane_risk = torch.maximum(
+            ttc_current_lead_risk,
+            torch.maximum(thw_current_lead_risk, gap_current_lead_risk),
+        )
 
         risk_score = torch.clamp(
             overlap_risk
-            + 0.5 * torch.maximum(ttc_lead_risk, ttc_follow_risk)
-            + 0.5 * torch.maximum(thw_lead_risk, thw_follow_risk)
-            + 0.3 * torch.maximum(gap_lead_risk, gap_follow_risk),
+            + target_lane_scale
+            * (
+                self.target_ttc_thw_weight * torch.maximum(target_ttc_risk, target_thw_risk)
+                + self.target_gap_weight * target_gap_risk
+            )
+            + self.current_lane_risk_weight * current_lane_risk,
             min=0.0,
             max=1.0,
         )
@@ -230,6 +305,20 @@ class PredictiveSafetyOracle:
             "min_gap_lead": min_gap_lead.unsqueeze(1),
             "min_gap_follow": min_gap_follow.unsqueeze(1),
             "future_overlap": future_overlap.float().unsqueeze(1),
+            "min_ttc_current_lead": min_ttc_current_lead.unsqueeze(1),
+            "min_ttc_target_lead": min_ttc_target_lead.unsqueeze(1),
+            "min_ttc_target_follow": min_ttc_target_follow.unsqueeze(1),
+            "min_thw_current_lead": min_thw_current_lead.unsqueeze(1),
+            "min_thw_target_lead": min_thw_target_lead.unsqueeze(1),
+            "min_thw_target_follow": min_thw_target_follow.unsqueeze(1),
+            "min_gap_current_lead": min_gap_current_lead.unsqueeze(1),
+            "min_gap_target_lead": min_gap_target_lead.unsqueeze(1),
+            "min_gap_target_follow": min_gap_target_follow.unsqueeze(1),
+            "dynamic_gap_lead_threshold": dynamic_gap_lead_threshold.unsqueeze(1),
+            "dynamic_gap_follow_threshold": dynamic_gap_follow_threshold.unsqueeze(1),
+            "merge_intent_active": merge_intent.float().unsqueeze(1),
+            "near_merge_zone": near_merge_zone.float().unsqueeze(1),
+            "target_lane_active": target_lane_active.float().unsqueeze(1),
         }
 
     def get_labels(self, states_tensor: torch.Tensor, actions: Optional[torch.Tensor] = None) -> torch.Tensor:
