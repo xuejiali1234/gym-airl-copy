@@ -13,11 +13,15 @@ U220_TIMESTEPS = 220 * STEPS_PER_EPOCH
 
 BASE_ENV = {
     "PROBE_EPOCHS": "300",
-    "PROBE_SAVE_FREQ_EPOCHS": "5",
+    "PROBE_SAVE_FREQ_EPOCHS": "1",
     "PROBE_QUICK_EVAL_EPISODES": "8",
     "PROBE_FULL_EVAL_EPISODES": "100",
+    "PROBE_FULL_EVAL_PRE_END_EPOCH": "0",
+    "PROBE_FULL_EVAL_PRE_FREQ_EPOCHS": "1",
+    "PROBE_FULL_EVAL_FREQ_EPOCHS": "1",
+    "PROBE_EPOCH0_EVAL_EPISODES": "100",
     "PROBE_REWARD_NORM": "0",
-    "PROBE_BEST_SELECT_START_EPOCH": "260",
+    "PROBE_BEST_SELECT_START_EPOCH": "270",
 }
 
 CONTROL_ENV = {
@@ -33,35 +37,53 @@ CONTROL_ENV = {
     "PROBE_SAFETY_LIGHT_UNFREEZE_LR": "5e-6",
     "PROBE_LATE_N_DISC_EPOCH": "230",
     "PROBE_LATE_N_DISC_UPDATES": "4",
+    "PROBE_SAFETY_DECAY_EPOCH": "250",
+    "PROBE_SAFETY_DECAY_LR": "2.5e-6",
+    "PROBE_SAFETY_RAMP_UNFREEZE_EPOCHS": "0",
+    "PROBE_SAFETY_DECAY_RAMP_EPOCHS": "0",
     "PROBE_SAFETY_FUSE_FEATURE": "0",
     "PROBE_SAFETY_EMBED_DIM": "1",
-    "PROBE_ENABLE_PREDICTIVE_SAFETY_CRITIC": "1",
+    "PROBE_ENABLE_PREDICTIVE_SAFETY_CRITIC": "0",
     "PROBE_PREDICTIVE_SAFETY_HORIZON_STEPS": "10",
     "PROBE_PREDICTIVE_SAFETY_DT": "0.1",
     "PROBE_PREDICTIVE_SAFETY_USE_CANDIDATES": "1",
     "PROBE_PREDICTIVE_SAFETY_GEN_PENALTY": "0.0",
+    "PROBE_ENABLE_PREDICTIVE_SAFETY_RESIDUAL": "1",
+    "PROBE_PREDICTIVE_SAFETY_RESIDUAL_SCALE": "0.5",
+    "PROBE_SAFETY_REG_COEFF": "0.0",
+    "PROBE_PREDICTIVE_SAFETY_BASE_REG_COEFF": "0.0",
+    "PROBE_PREDICTIVE_SAFETY_LATE_REG_EPOCH": "250",
+    "PROBE_PREDICTIVE_SAFETY_LATE_REG_COEFF": "0.0",
+    "PROBE_PREDICTIVE_SAFETY_REG_MODE": "legacy_aux",
+    "PROBE_PREDICTIVE_SAFETY_ENABLE_CPAIR_ADDITIVE": "1",
+    "PROBE_PREDICTIVE_SAFETY_CPAIR_ADDITIVE_START_EPOCH": "1",
+    "PROBE_PREDICTIVE_SAFETY_CPAIR_ADDITIVE_COEFF": "0.03",
+    "PROBE_PREDICTIVE_SAFETY_CANDIDATE_SET": "current",
+    "PROBE_PREDICTIVE_SAFETY_SAFE_SELECTION": "min_risk",
+    "PROBE_PREDICTIVE_SAFETY_RANK_METRIC": "clipped",
 }
 
 EXPERIMENTS = [
     {
-        "name": "P300_U220_D230_P1_PSC_Scalar",
-        "description": "Predictive safety scalar only on the U220_D230 training base.",
+        "name": "P45_P30_SmoothTransitions",
+        "description": "P30 base with only schedule smoothing: safety unfreeze ramps over epochs 220-240, D5/D4 transition is spread over 210-230, and Decay250 ramps over 250-270; no reward/objective changes.",
         "env": {
-            "PROBE_PREDICTIVE_SAFETY_REG_COEFF": "0.0",
+            "PROBE_SAFETY_RAMP_UNFREEZE_EPOCHS": "20",
+            "PROBE_LATE_N_DISC_RAMP_START_EPOCH": "210",
+            "PROBE_LATE_N_DISC_RAMP_END_EPOCH": "230",
+            "PROBE_SAFETY_DECAY_RAMP_EPOCHS": "20",
+            "PROBE_BEST_SELECT_START_EPOCH": "270",
+            "PROBE_SAVE_FREQ_EPOCHS": "1",
         },
     },
     {
-        "name": "P300_U220_D230_P2_PSC_Reg003",
-        "description": "Predictive safety scalar with weak discriminator ranking regulator (0.03).",
+        "name": "P30_CPairD250_NoLateLR_Save1_Rerun",
+        "description": "Original P30 rerun for reproducibility: residual0.5, no legacy aux, CPair additive 0.03 from epoch 1, D230 late n_disc=4, Decay250, no generator penalty.",
         "env": {
-            "PROBE_PREDICTIVE_SAFETY_REG_COEFF": "0.03",
-        },
-    },
-    {
-        "name": "P300_U220_D230_P3_PSC_Reg006",
-        "description": "Predictive safety scalar with normal discriminator ranking regulator (0.06).",
-        "env": {
-            "PROBE_PREDICTIVE_SAFETY_REG_COEFF": "0.06",
+            "PROBE_SAFETY_RAMP_UNFREEZE_EPOCHS": "0",
+            "PROBE_SAFETY_DECAY_RAMP_EPOCHS": "0",
+            "PROBE_BEST_SELECT_START_EPOCH": "270",
+            "PROBE_SAVE_FREQ_EPOCHS": "1",
         },
     },
 ]

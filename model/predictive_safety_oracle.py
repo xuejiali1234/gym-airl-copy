@@ -270,19 +270,24 @@ class PredictiveSafetyOracle:
         target_ttc_risk = torch.maximum(ttc_target_lead_risk, ttc_target_follow_risk)
         target_thw_risk = torch.maximum(thw_target_lead_risk, thw_target_follow_risk)
         target_gap_risk = torch.maximum(gap_target_lead_risk, gap_target_follow_risk)
+        target_lead_ttc_thw_risk = torch.maximum(ttc_target_lead_risk, thw_target_lead_risk)
+        target_lead_risk = target_lane_scale * (
+            self.target_ttc_thw_weight * target_lead_ttc_thw_risk
+            + self.target_gap_weight * gap_target_lead_risk
+        )
         current_lane_risk = torch.maximum(
             ttc_current_lead_risk,
             torch.maximum(thw_current_lead_risk, gap_current_lead_risk),
         )
 
+        target_lane_risk = target_lane_scale * (
+            self.target_ttc_thw_weight * torch.maximum(target_ttc_risk, target_thw_risk)
+            + self.target_gap_weight * target_gap_risk
+        )
+        current_lane_weighted_risk = self.current_lane_risk_weight * current_lane_risk
+        risk_score_unclipped = overlap_risk + target_lane_risk + current_lane_weighted_risk
         risk_score = torch.clamp(
-            overlap_risk
-            + target_lane_scale
-            * (
-                self.target_ttc_thw_weight * torch.maximum(target_ttc_risk, target_thw_risk)
-                + self.target_gap_weight * target_gap_risk
-            )
-            + self.current_lane_risk_weight * current_lane_risk,
+            risk_score_unclipped,
             min=0.0,
             max=1.0,
         )
@@ -297,7 +302,18 @@ class PredictiveSafetyOracle:
 
         return {
             "risk_score": risk_score.unsqueeze(1),
+            "risk_score_unclipped": risk_score_unclipped.unsqueeze(1),
             "critical_label": critical.float().unsqueeze(1),
+            "overlap_risk": overlap_risk.unsqueeze(1),
+            "target_ttc_risk": target_ttc_risk.unsqueeze(1),
+            "target_thw_risk": target_thw_risk.unsqueeze(1),
+            "target_gap_risk": target_gap_risk.unsqueeze(1),
+            "target_lead_risk": target_lead_risk.unsqueeze(1),
+            "target_lead_ttc_thw_risk": target_lead_ttc_thw_risk.unsqueeze(1),
+            "target_lead_gap_risk": gap_target_lead_risk.unsqueeze(1),
+            "current_lane_risk": current_lane_risk.unsqueeze(1),
+            "target_lane_weighted_risk": target_lane_risk.unsqueeze(1),
+            "current_lane_weighted_risk": current_lane_weighted_risk.unsqueeze(1),
             "min_ttc_lead": min_ttc_lead.unsqueeze(1),
             "min_ttc_follow": min_ttc_follow.unsqueeze(1),
             "min_thw_lead": min_thw_lead.unsqueeze(1),

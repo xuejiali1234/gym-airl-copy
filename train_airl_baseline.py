@@ -3,6 +3,7 @@ import csv
 import copy
 import json
 import random
+import hashlib
 from datetime import datetime
 import gymnasium as gym
 import numpy as np
@@ -78,6 +79,42 @@ def save_run_metadata(log_dir, payload):
     metadata_path = os.path.join(log_dir, "run_config.json")
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def build_safe_checkpoint_path(checkpoint_dir, run_label, *, probe_tag=None, prefix="baseline_policy", suffix="final", epoch=None):
+    """Build a checkpoint path that stays safely below Windows MAX_PATH.
+
+    Probe runs already have long directory names; using the full run_label again in
+    the checkpoint filename can push the absolute path to ~260 chars and trigger a
+    save recursion bug inside SB3 on Windows. Prefer the shorter probe tag for file
+    names, and fall back to a compact hashed label if the full path is still long.
+    """
+
+    def _normalize_label(value: str) -> str:
+        return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)
+
+    def _filename(label: str) -> str:
+        if epoch is None:
+            return f"{prefix}_{label}_{suffix}.zip"
+        return f"{prefix}_{label}_{suffix}_{epoch}.zip"
+
+    file_label = _normalize_label(str(probe_tag or run_label))
+    candidate = os.path.join(checkpoint_dir, _filename(file_label))
+    if len(os.path.abspath(candidate)) < 245:
+        return candidate
+
+    digest = hashlib.md5(str(run_label).encode("utf-8")).hexdigest()[:8]
+    compact_label = file_label[:32]
+    compact = f"{compact_label}_{digest}"
+    candidate = os.path.join(checkpoint_dir, _filename(compact))
+    if len(os.path.abspath(candidate)) < 245:
+        return candidate
+
+    if epoch is None:
+        fallback_name = f"{prefix}_{digest}_{suffix}.zip"
+    else:
+        fallback_name = f"{prefix}_{digest}_{suffix}_{epoch}.zip"
+    return os.path.join(checkpoint_dir, fallback_name)
 
 def convert_to_trajectories(dataset, cfg):
     """将专家数据打包，并根据 Config 决定是否将 goal 拼接到 state 中"""
@@ -278,12 +315,15 @@ def apply_probe_overrides(cfg):
     set_if_present("PROBE_LATE_GEN_LR", "PROBE_LATE_GEN_LR", float)
     set_if_present("PROBE_LATE_N_DISC_EPOCH", "PROBE_LATE_N_DISC_EPOCH", int)
     set_if_present("PROBE_LATE_N_DISC_UPDATES", "PROBE_LATE_N_DISC_UPDATES", int)
+    set_if_present("PROBE_LATE_N_DISC_RAMP_START_EPOCH", "PROBE_LATE_N_DISC_RAMP_START_EPOCH", int)
+    set_if_present("PROBE_LATE_N_DISC_RAMP_END_EPOCH", "PROBE_LATE_N_DISC_RAMP_END_EPOCH", int)
     set_if_present("PROBE_BEST_SELECT_START_EPOCH", "PROBE_BEST_SELECT_START_EPOCH", int)
     set_if_present("PROBE_SAFETY_UNFREEZE_TIMESTEPS", "SAFETY_UNFREEZE_TIMESTEPS", int)
     set_if_present("PROBE_SAFETY_LIGHT_UNFREEZE_LR", "SAFETY_LIGHT_UNFREEZE_LR", float)
     set_if_present("PROBE_SAFETY_RAMP_UNFREEZE_EPOCHS", "PROBE_SAFETY_RAMP_UNFREEZE_EPOCHS", int)
     set_if_present("PROBE_SAFETY_DECAY_EPOCH", "PROBE_SAFETY_DECAY_EPOCH", int)
     set_if_present("PROBE_SAFETY_DECAY_LR", "PROBE_SAFETY_DECAY_LR", float)
+    set_if_present("PROBE_SAFETY_DECAY_RAMP_EPOCHS", "PROBE_SAFETY_DECAY_RAMP_EPOCHS", int)
     set_if_present("PROBE_SAFETY_EMBED_DIM", "SAFETY_EMBED_DIM", int)
     set_if_present("PROBE_SAFETY_ORACLE_TTC_THRESHOLD", "SAFETY_ORACLE_TTC_THRESHOLD", float)
     set_if_present("PROBE_SAFETY_ORACLE_WARNING_TTC_THRESHOLD", "SAFETY_ORACLE_WARNING_TTC_THRESHOLD", float)
@@ -294,18 +334,141 @@ def apply_probe_overrides(cfg):
     set_if_present("PROBE_PREDICTIVE_SAFETY_RESIDUAL_SCALE", "PREDICTIVE_SAFETY_RESIDUAL_SCALE", float)
     set_if_present("PROBE_PREDICTIVE_SAFETY_REG_COEFF", "PREDICTIVE_SAFETY_REG_COEFF", float)
     set_if_present("PROBE_PREDICTIVE_SAFETY_GEN_PENALTY", "PREDICTIVE_SAFETY_GEN_PENALTY", float)
+    set_if_present(
+        "PROBE_PREDICTIVE_SAFETY_GEN_PENALTY_START_EPOCH",
+        "PREDICTIVE_SAFETY_GEN_PENALTY_START_EPOCH",
+        int,
+    )
+    set_if_present(
+        "PROBE_PREDICTIVE_SAFETY_GEN_PENALTY_THRESHOLD",
+        "PREDICTIVE_SAFETY_GEN_PENALTY_THRESHOLD",
+        float,
+    )
+    set_if_present(
+        "PROBE_PREDICTIVE_SAFETY_GEN_PENALTY_CLIP_MIN",
+        "PREDICTIVE_SAFETY_GEN_PENALTY_CLIP_MIN",
+        float,
+    )
+    set_if_present(
+        "PROBE_PREDICTIVE_SAFETY_GEN_PENALTY_CLIP_MAX",
+        "PREDICTIVE_SAFETY_GEN_PENALTY_CLIP_MAX",
+        float,
+    )
+    set_if_present(
+        "PROBE_PREDICTIVE_SAFETY_GEN_PENALTY_SOURCE",
+        "PREDICTIVE_SAFETY_GEN_PENALTY_SOURCE",
+        str,
+    )
+    set_if_present("PROBE_PREDICTIVE_SAFETY_REG_MARGIN", "PREDICTIVE_SAFETY_REG_MARGIN", float)
+    set_if_present("PROBE_PREDICTIVE_SAFETY_BASE_REG_COEFF", "PREDICTIVE_SAFETY_BASE_REG_COEFF", float)
+    set_if_present("PROBE_PREDICTIVE_SAFETY_LATE_REG_EPOCH", "PREDICTIVE_SAFETY_LATE_REG_EPOCH", int)
+    set_if_present("PROBE_PREDICTIVE_SAFETY_LATE_REG_COEFF", "PREDICTIVE_SAFETY_LATE_REG_COEFF", float)
+    set_if_present(
+        "PROBE_PREDICTIVE_SAFETY_RAMP_REG_START_EPOCH",
+        "PREDICTIVE_SAFETY_RAMP_REG_START_EPOCH",
+        int,
+    )
+    set_if_present(
+        "PROBE_PREDICTIVE_SAFETY_RAMP_REG_END_EPOCH",
+        "PREDICTIVE_SAFETY_RAMP_REG_END_EPOCH",
+        int,
+    )
+    set_if_present(
+        "PROBE_PREDICTIVE_SAFETY_CPAIR_ADDITIVE_START_EPOCH",
+        "PREDICTIVE_SAFETY_CPAIR_ADDITIVE_START_EPOCH",
+        int,
+    )
+    set_if_present(
+        "PROBE_PREDICTIVE_SAFETY_CPAIR_ADDITIVE_COEFF",
+        "PREDICTIVE_SAFETY_CPAIR_ADDITIVE_COEFF",
+        float,
+    )
+    set_if_present(
+        "PROBE_PREDICTIVE_SAFETY_LATE_TINY_CPAIR_START_EPOCH",
+        "PREDICTIVE_SAFETY_LATE_TINY_CPAIR_START_EPOCH",
+        int,
+    )
+    set_if_present(
+        "PROBE_PREDICTIVE_SAFETY_LATE_TINY_CPAIR_COEFF",
+        "PREDICTIVE_SAFETY_LATE_TINY_CPAIR_COEFF",
+        float,
+    )
+    set_if_present(
+        "PROBE_PREDICTIVE_SAFETY_LATE_TINY_CPAIR_MARGIN",
+        "PREDICTIVE_SAFETY_LATE_TINY_CPAIR_MARGIN",
+        float,
+    )
     predictive_residual = parse_env_bool("PROBE_ENABLE_PREDICTIVE_SAFETY_RESIDUAL")
     if predictive_residual is not None:
         cfg.ENABLE_PREDICTIVE_SAFETY_RESIDUAL = predictive_residual
         overrides["ENABLE_PREDICTIVE_SAFETY_RESIDUAL"] = predictive_residual
+    predictive_cpair_additive = parse_env_bool("PROBE_PREDICTIVE_SAFETY_ENABLE_CPAIR_ADDITIVE")
+    if predictive_cpair_additive is not None:
+        cfg.PREDICTIVE_SAFETY_ENABLE_CPAIR_ADDITIVE = predictive_cpair_additive
+        overrides["PREDICTIVE_SAFETY_ENABLE_CPAIR_ADDITIVE"] = predictive_cpair_additive
     predictive_reg_mode = os.environ.get("PROBE_PREDICTIVE_SAFETY_REG_MODE")
     if predictive_reg_mode:
         cfg.PREDICTIVE_SAFETY_REG_MODE = predictive_reg_mode
         overrides["PREDICTIVE_SAFETY_REG_MODE"] = predictive_reg_mode
+    predictive_candidate_set = os.environ.get("PROBE_PREDICTIVE_SAFETY_CANDIDATE_SET")
+    if predictive_candidate_set:
+        cfg.PREDICTIVE_SAFETY_CANDIDATE_SET = predictive_candidate_set
+        overrides["PREDICTIVE_SAFETY_CANDIDATE_SET"] = predictive_candidate_set
+    predictive_safe_selection = os.environ.get("PROBE_PREDICTIVE_SAFETY_SAFE_SELECTION")
+    if predictive_safe_selection:
+        cfg.PREDICTIVE_SAFETY_SAFE_SELECTION = predictive_safe_selection
+        overrides["PREDICTIVE_SAFETY_SAFE_SELECTION"] = predictive_safe_selection
+    predictive_rank_metric = os.environ.get("PROBE_PREDICTIVE_SAFETY_RANK_METRIC")
+    if predictive_rank_metric:
+        cfg.PREDICTIVE_SAFETY_RANK_METRIC = predictive_rank_metric
+        overrides["PREDICTIVE_SAFETY_RANK_METRIC"] = predictive_rank_metric
+    predictive_focused_cpair_enable = parse_env_bool("PROBE_PREDICTIVE_SAFETY_FOCUSED_CPAIR_ENABLE")
+    if predictive_focused_cpair_enable is not None:
+        cfg.PREDICTIVE_SAFETY_FOCUSED_CPAIR_ENABLE = predictive_focused_cpair_enable
+        overrides["PREDICTIVE_SAFETY_FOCUSED_CPAIR_ENABLE"] = predictive_focused_cpair_enable
+    set_if_present(
+        "PROBE_PREDICTIVE_SAFETY_FOCUSED_CPAIR_MIN_GAP",
+        "PREDICTIVE_SAFETY_FOCUSED_CPAIR_MIN_GAP",
+        float,
+    )
+    set_if_present(
+        "PROBE_PREDICTIVE_SAFETY_FOCUSED_CPAIR_MIN_POLICY_RISK",
+        "PREDICTIVE_SAFETY_FOCUSED_CPAIR_MIN_POLICY_RISK",
+        float,
+    )
+    set_if_present(
+        "PROBE_PREDICTIVE_SAFETY_FOCUSED_CPAIR_WEIGHT_CLIP",
+        "PREDICTIVE_SAFETY_FOCUSED_CPAIR_WEIGHT_CLIP",
+        float,
+    )
+    predictive_focused_cpair_weight_source = os.environ.get("PROBE_PREDICTIVE_SAFETY_FOCUSED_CPAIR_WEIGHT_SOURCE")
+    if predictive_focused_cpair_weight_source:
+        cfg.PREDICTIVE_SAFETY_FOCUSED_CPAIR_WEIGHT_SOURCE = predictive_focused_cpair_weight_source
+        overrides["PREDICTIVE_SAFETY_FOCUSED_CPAIR_WEIGHT_SOURCE"] = predictive_focused_cpair_weight_source
+    predictive_late_tiny_enable = parse_env_bool("PROBE_PREDICTIVE_SAFETY_LATE_TINY_CPAIR_ENABLE")
+    if predictive_late_tiny_enable is not None:
+        cfg.PREDICTIVE_SAFETY_LATE_TINY_CPAIR_ENABLE = predictive_late_tiny_enable
+        overrides["PREDICTIVE_SAFETY_LATE_TINY_CPAIR_ENABLE"] = predictive_late_tiny_enable
+    predictive_late_tiny_candidate_set = os.environ.get("PROBE_PREDICTIVE_SAFETY_LATE_TINY_CPAIR_CANDIDATE_SET")
+    if predictive_late_tiny_candidate_set:
+        cfg.PREDICTIVE_SAFETY_LATE_TINY_CPAIR_CANDIDATE_SET = predictive_late_tiny_candidate_set
+        overrides["PREDICTIVE_SAFETY_LATE_TINY_CPAIR_CANDIDATE_SET"] = predictive_late_tiny_candidate_set
+    predictive_late_tiny_safe_selection = os.environ.get("PROBE_PREDICTIVE_SAFETY_LATE_TINY_CPAIR_SAFE_SELECTION")
+    if predictive_late_tiny_safe_selection:
+        cfg.PREDICTIVE_SAFETY_LATE_TINY_CPAIR_SAFE_SELECTION = predictive_late_tiny_safe_selection
+        overrides["PREDICTIVE_SAFETY_LATE_TINY_CPAIR_SAFE_SELECTION"] = predictive_late_tiny_safe_selection
+    predictive_late_tiny_rank_metric = os.environ.get("PROBE_PREDICTIVE_SAFETY_LATE_TINY_CPAIR_RANK_METRIC")
+    if predictive_late_tiny_rank_metric:
+        cfg.PREDICTIVE_SAFETY_LATE_TINY_CPAIR_RANK_METRIC = predictive_late_tiny_rank_metric
+        overrides["PREDICTIVE_SAFETY_LATE_TINY_CPAIR_RANK_METRIC"] = predictive_late_tiny_rank_metric
     set_if_present("PROBE_ENT_COEF", "PPO_ENT_COEF", float)
     set_if_present("PROBE_SAVE_FREQ_EPOCHS", "PROBE_SAVE_FREQ_EPOCHS", int)
     set_if_present("PROBE_QUICK_EVAL_EPISODES", "PROBE_QUICK_EVAL_EPISODES", int)
     set_if_present("PROBE_FULL_EVAL_EPISODES", "PROBE_FULL_EVAL_EPISODES", int)
+    set_if_present("PROBE_FULL_EVAL_FREQ_EPOCHS", "PROBE_FULL_EVAL_FREQ_EPOCHS", int)
+    set_if_present("PROBE_FULL_EVAL_PRE_END_EPOCH", "PROBE_FULL_EVAL_PRE_END_EPOCH", int)
+    set_if_present("PROBE_FULL_EVAL_PRE_FREQ_EPOCHS", "PROBE_FULL_EVAL_PRE_FREQ_EPOCHS", int)
+    set_if_present("PROBE_EPOCH0_EVAL_EPISODES", "PROBE_EPOCH0_EVAL_EPISODES", int)
     set_if_present("PROBE_N_DISC_UPDATES", "PROBE_N_DISC_UPDATES", int)
 
     reward_norm = parse_env_bool("PROBE_REWARD_NORM")
@@ -359,8 +522,83 @@ def main():
     predictive_safety_use_candidates = bool(getattr(cfg, "PREDICTIVE_SAFETY_USE_CANDIDATES", True))
     predictive_safety_residual_scale = float(getattr(cfg, "PREDICTIVE_SAFETY_RESIDUAL_SCALE", 0.3))
     predictive_safety_reg_coeff = float(getattr(cfg, "PREDICTIVE_SAFETY_REG_COEFF", 0.0))
+    predictive_safety_gen_penalty = float(getattr(cfg, "PREDICTIVE_SAFETY_GEN_PENALTY", 0.0))
+    predictive_safety_gen_penalty_start_epoch = int(
+        getattr(cfg, "PREDICTIVE_SAFETY_GEN_PENALTY_START_EPOCH", 270)
+    )
+    predictive_safety_gen_penalty_threshold = float(
+        getattr(cfg, "PREDICTIVE_SAFETY_GEN_PENALTY_THRESHOLD", 0.7)
+    )
+    predictive_safety_gen_penalty_clip_min = float(
+        getattr(cfg, "PREDICTIVE_SAFETY_GEN_PENALTY_CLIP_MIN", -0.03)
+    )
+    predictive_safety_gen_penalty_clip_max = float(
+        getattr(cfg, "PREDICTIVE_SAFETY_GEN_PENALTY_CLIP_MAX", 0.0)
+    )
+    predictive_safety_gen_penalty_source = str(
+        getattr(cfg, "PREDICTIVE_SAFETY_GEN_PENALTY_SOURCE", "q_safe_risk")
+    )
     predictive_safety_reg_mode = str(getattr(cfg, "PREDICTIVE_SAFETY_REG_MODE", "candidate_pair_ranking"))
+    predictive_safety_candidate_set = str(getattr(cfg, "PREDICTIVE_SAFETY_CANDIDATE_SET", "current"))
+    predictive_safety_safe_selection = str(getattr(cfg, "PREDICTIVE_SAFETY_SAFE_SELECTION", "min_risk"))
+    predictive_safety_rank_metric = str(getattr(cfg, "PREDICTIVE_SAFETY_RANK_METRIC", "clipped"))
     predictive_safety_reg_margin = float(getattr(cfg, "PREDICTIVE_SAFETY_REG_MARGIN", 0.2))
+    predictive_safety_base_reg_coeff = getattr(cfg, "PREDICTIVE_SAFETY_BASE_REG_COEFF", None)
+    if predictive_safety_base_reg_coeff is None:
+        predictive_safety_base_reg_coeff = getattr(cfg, "SAFETY_REGULATOR_COEFF", 0.0)
+    predictive_safety_base_reg_coeff = float(predictive_safety_base_reg_coeff)
+    predictive_safety_late_reg_epoch = getattr(cfg, "PREDICTIVE_SAFETY_LATE_REG_EPOCH", None)
+    predictive_safety_late_reg_coeff = getattr(cfg, "PREDICTIVE_SAFETY_LATE_REG_COEFF", None)
+    if predictive_safety_late_reg_coeff is None:
+        predictive_safety_late_reg_coeff = predictive_safety_base_reg_coeff
+    predictive_safety_late_reg_coeff = float(predictive_safety_late_reg_coeff)
+    predictive_safety_ramp_reg_start_epoch = getattr(cfg, "PREDICTIVE_SAFETY_RAMP_REG_START_EPOCH", None)
+    predictive_safety_ramp_reg_end_epoch = getattr(cfg, "PREDICTIVE_SAFETY_RAMP_REG_END_EPOCH", None)
+    predictive_safety_enable_cpair_additive = bool(
+        getattr(cfg, "PREDICTIVE_SAFETY_ENABLE_CPAIR_ADDITIVE", False)
+    )
+    predictive_safety_cpair_additive_start_epoch = int(
+        getattr(cfg, "PREDICTIVE_SAFETY_CPAIR_ADDITIVE_START_EPOCH", 260)
+    )
+    predictive_safety_cpair_additive_coeff = float(
+        getattr(cfg, "PREDICTIVE_SAFETY_CPAIR_ADDITIVE_COEFF", 0.0)
+    )
+    predictive_safety_focused_cpair_enable = bool(
+        getattr(cfg, "PREDICTIVE_SAFETY_FOCUSED_CPAIR_ENABLE", False)
+    )
+    predictive_safety_focused_cpair_min_gap = float(
+        getattr(cfg, "PREDICTIVE_SAFETY_FOCUSED_CPAIR_MIN_GAP", 0.10)
+    )
+    predictive_safety_focused_cpair_min_policy_risk = float(
+        getattr(cfg, "PREDICTIVE_SAFETY_FOCUSED_CPAIR_MIN_POLICY_RISK", 0.30)
+    )
+    predictive_safety_focused_cpair_weight_clip = float(
+        getattr(cfg, "PREDICTIVE_SAFETY_FOCUSED_CPAIR_WEIGHT_CLIP", 0.20)
+    )
+    predictive_safety_focused_cpair_weight_source = str(
+        getattr(cfg, "PREDICTIVE_SAFETY_FOCUSED_CPAIR_WEIGHT_SOURCE", "raw")
+    )
+    predictive_safety_late_tiny_cpair_enable = bool(
+        getattr(cfg, "PREDICTIVE_SAFETY_LATE_TINY_CPAIR_ENABLE", False)
+    )
+    predictive_safety_late_tiny_cpair_start_epoch = int(
+        getattr(cfg, "PREDICTIVE_SAFETY_LATE_TINY_CPAIR_START_EPOCH", 270)
+    )
+    predictive_safety_late_tiny_cpair_coeff = float(
+        getattr(cfg, "PREDICTIVE_SAFETY_LATE_TINY_CPAIR_COEFF", 0.0)
+    )
+    predictive_safety_late_tiny_cpair_candidate_set = str(
+        getattr(cfg, "PREDICTIVE_SAFETY_LATE_TINY_CPAIR_CANDIDATE_SET", "candidate_v2_leadaware")
+    )
+    predictive_safety_late_tiny_cpair_safe_selection = str(
+        getattr(cfg, "PREDICTIVE_SAFETY_LATE_TINY_CPAIR_SAFE_SELECTION", "task_safe")
+    )
+    predictive_safety_late_tiny_cpair_rank_metric = str(
+        getattr(cfg, "PREDICTIVE_SAFETY_LATE_TINY_CPAIR_RANK_METRIC", "clipped")
+    )
+    predictive_safety_late_tiny_cpair_margin = float(
+        getattr(cfg, "PREDICTIVE_SAFETY_LATE_TINY_CPAIR_MARGIN", 0.1)
+    )
     
     # ==========================================
     # 1. 文件夹与日志系统初始化
@@ -407,7 +645,7 @@ def main():
             f"fuse_feature={'feature_fusion' if safety_fuse_feature else 'scalar_only'}, "
             f"branch={'real' if enable_safety_branch else 'zero'}, "
             f"aux_loss={enable_safety_aux}, "
-            f"reg_weight={getattr(cfg, 'SAFETY_REGULATOR_COEFF', 0.0) if enable_safety_aux else 0.0})"
+            f"reg_weight={predictive_safety_base_reg_coeff if enable_safety_aux else 0.0})"
         )
         if predictive_replaces_safety:
             print(
@@ -421,7 +659,24 @@ def main():
                 "[*] Predictive safety residual enabled "
                 f"(scale={predictive_safety_residual_scale}, horizon_steps={predictive_safety_horizon_steps}, "
                 f"dt={predictive_safety_dt}, candidates={predictive_safety_use_candidates}, "
-                f"reg_coeff={predictive_safety_reg_coeff}, reg_mode={predictive_safety_reg_mode})"
+                f"base_reg={predictive_safety_base_reg_coeff}, late_reg_epoch={predictive_safety_late_reg_epoch}, "
+                f"late_reg_coeff={predictive_safety_late_reg_coeff}, reg_mode=legacy_aux, "
+                f"gen_penalty={predictive_safety_gen_penalty}, "
+                f"gen_penalty_start={predictive_safety_gen_penalty_start_epoch}, "
+                f"gen_penalty_threshold={predictive_safety_gen_penalty_threshold}, "
+                f"gen_penalty_clip=({predictive_safety_gen_penalty_clip_min},{predictive_safety_gen_penalty_clip_max}), "
+                f"gen_penalty_source={predictive_safety_gen_penalty_source}, "
+                f"cpair_additive={predictive_safety_enable_cpair_additive}, "
+                f"cpair_start={predictive_safety_cpair_additive_start_epoch}, "
+                f"cpair_coeff={predictive_safety_cpair_additive_coeff}, "
+                f"candidate_set={predictive_safety_candidate_set}, "
+                f"safe_selection={predictive_safety_safe_selection}, "
+                f"rank_metric={predictive_safety_rank_metric}, "
+                f"focused_cpair={predictive_safety_focused_cpair_enable}, "
+                f"focused_gap={predictive_safety_focused_cpair_min_gap}, "
+                f"focused_policy_risk={predictive_safety_focused_cpair_min_policy_risk}, "
+                f"focused_weight_clip={predictive_safety_focused_cpair_weight_clip}, "
+                f"focused_weight_source={predictive_safety_focused_cpair_weight_source})"
             )
     else:
         print("[*] 当前安全模块: 关闭")
@@ -449,6 +704,7 @@ def main():
 
     safety_net = None
     predictive_safety_net = None
+    predictive_safety_oracle = None
     if enable_safety:
         if enable_safety_branch:
             print("[*] 正在预训练安全网络...")
@@ -587,7 +843,14 @@ def main():
             expert_std_x=train_dataset.expert_std[0],
             divider_x=divider_x,
             goal_bonus=goal_bonus,
+            high_risk_penalty_lambda=0.0,
+            high_risk_threshold=predictive_safety_gen_penalty_threshold,
+            high_risk_penalty_clip_min=predictive_safety_gen_penalty_clip_min,
+            high_risk_penalty_clip_max=predictive_safety_gen_penalty_clip_max,
+            high_risk_source=predictive_safety_gen_penalty_source,
+            predictive_safety_oracle=predictive_safety_oracle,
         )
+        goal_reward_wrapper = reward_net
         
         # 2. 生成器 (PPO)：提取特征后，送入严格对齐的 128x128 网络
         policy_kwargs = dict(
@@ -632,7 +895,14 @@ def main():
             expert_std_x=train_dataset.expert_std[0],
             divider_x=divider_x,
             goal_bonus=goal_bonus,
+            high_risk_penalty_lambda=0.0,
+            high_risk_threshold=predictive_safety_gen_penalty_threshold,
+            high_risk_penalty_clip_min=predictive_safety_gen_penalty_clip_min,
+            high_risk_penalty_clip_max=predictive_safety_gen_penalty_clip_max,
+            high_risk_source=predictive_safety_gen_penalty_source,
+            predictive_safety_oracle=predictive_safety_oracle,
         )
+        goal_reward_wrapper = reward_net
         
         # 2. 生成器 (PPO)：直接送入严格对齐的 128x128 网络
         policy_kwargs = dict(
@@ -690,18 +960,37 @@ def main():
     )
     if enable_safety:
         safety_loss_weight = 0.0
-        safety_reg_mode = "legacy"
+        safety_reg_mode = "legacy_aux"
+        safety_cpair_additive_weight = 0.0
+        safety_late_tiny_cpair_weight = 0.0
         if enable_safety_aux:
-            if enable_predictive_safety:
+            if enable_predictive_safety and not enable_predictive_safety_residual:
                 safety_loss_weight = predictive_safety_reg_coeff
                 safety_reg_mode = predictive_safety_reg_mode
             else:
-                safety_loss_weight = cfg.SAFETY_REGULATOR_COEFF
+                safety_loss_weight = predictive_safety_base_reg_coeff
+                safety_reg_mode = "legacy_aux"
+                if enable_predictive_safety_residual and predictive_safety_enable_cpair_additive:
+                    safety_cpair_additive_weight = 0.0
         airl_trainer = MildSafetyAIRL(
             **trainer_kwargs,
             safety_loss_weight=safety_loss_weight,
             safety_reg_mode=safety_reg_mode,
             safety_reg_margin=predictive_safety_reg_margin,
+            safety_cpair_additive_weight=safety_cpair_additive_weight,
+            safety_candidate_set=predictive_safety_candidate_set,
+            safety_safe_selection=predictive_safety_safe_selection,
+            safety_rank_metric=predictive_safety_rank_metric,
+            safety_focused_cpair_enable=predictive_safety_focused_cpair_enable,
+            safety_focused_cpair_min_gap=predictive_safety_focused_cpair_min_gap,
+            safety_focused_cpair_min_policy_risk=predictive_safety_focused_cpair_min_policy_risk,
+            safety_focused_cpair_weight_clip=predictive_safety_focused_cpair_weight_clip,
+            safety_focused_cpair_weight_source=predictive_safety_focused_cpair_weight_source,
+            safety_late_tiny_cpair_weight=safety_late_tiny_cpair_weight,
+            safety_late_tiny_candidate_set=predictive_safety_late_tiny_cpair_candidate_set,
+            safety_late_tiny_safe_selection=predictive_safety_late_tiny_cpair_safe_selection,
+            safety_late_tiny_rank_metric=predictive_safety_late_tiny_cpair_rank_metric,
+            safety_late_tiny_reg_margin=predictive_safety_late_tiny_cpair_margin,
         )
     else:
         airl_trainer = AIRL(**trainer_kwargs)
@@ -723,18 +1012,35 @@ def main():
     late_gen_lr = getattr(cfg, "PROBE_LATE_GEN_LR", None)
     late_n_disc_epoch = getattr(cfg, "PROBE_LATE_N_DISC_EPOCH", None)
     late_n_disc_updates = getattr(cfg, "PROBE_LATE_N_DISC_UPDATES", None)
+    late_n_disc_ramp_start_epoch = getattr(cfg, "PROBE_LATE_N_DISC_RAMP_START_EPOCH", None)
+    late_n_disc_ramp_end_epoch = getattr(cfg, "PROBE_LATE_N_DISC_RAMP_END_EPOCH", None)
     best_select_start_epoch = getattr(cfg, "PROBE_BEST_SELECT_START_EPOCH", 0)
     eval_freq_epochs = 1
     quick_eval_episodes = getattr(cfg, "PROBE_QUICK_EVAL_EPISODES", 8)
     full_eval_episodes = getattr(cfg, "PROBE_FULL_EVAL_EPISODES", 40)
+    full_eval_freq_epochs = getattr(cfg, "PROBE_FULL_EVAL_FREQ_EPOCHS", save_freq_epochs)
+    full_eval_pre_end_epoch = getattr(cfg, "PROBE_FULL_EVAL_PRE_END_EPOCH", 0)
+    full_eval_pre_freq_epochs = getattr(cfg, "PROBE_FULL_EVAL_PRE_FREQ_EPOCHS", full_eval_freq_epochs)
+    epoch0_eval_episodes = getattr(cfg, "PROBE_EPOCH0_EVAL_EPISODES", full_eval_episodes)
+    if full_eval_freq_epochs <= 0:
+        raise ValueError("PROBE_FULL_EVAL_FREQ_EPOCHS must be >= 1")
+    if full_eval_pre_freq_epochs <= 0:
+        raise ValueError("PROBE_FULL_EVAL_PRE_FREQ_EPOCHS must be >= 1")
+    if epoch0_eval_episodes <= 0:
+        raise ValueError("PROBE_EPOCH0_EVAL_EPISODES must be >= 1")
     n_eval_episodes = full_eval_episodes
     safety_unfreeze_timesteps = getattr(cfg, "SAFETY_UNFREEZE_TIMESTEPS", 100000)
     safety_light_unfreeze_lr = getattr(cfg, "SAFETY_LIGHT_UNFREEZE_LR", 1e-5)
     safety_ramp_unfreeze_epochs = getattr(cfg, "PROBE_SAFETY_RAMP_UNFREEZE_EPOCHS", 0)
     safety_decay_epoch = getattr(cfg, "PROBE_SAFETY_DECAY_EPOCH", None)
     safety_decay_lr = getattr(cfg, "PROBE_SAFETY_DECAY_LR", None)
+    safety_decay_ramp_epochs = getattr(cfg, "PROBE_SAFETY_DECAY_RAMP_EPOCHS", 0)
     safety_phase = "frozen" if enable_safety else "disabled"
     safety_current_grad_scale = 0.0
+    safety_aux_current_weight = float(safety_loss_weight if enable_safety else 0.0)
+    safety_cpair_current_weight = float(safety_cpair_additive_weight if enable_safety else 0.0)
+    safety_late_tiny_cpair_current_weight = float(safety_late_tiny_cpair_weight if enable_safety else 0.0)
+    gen_risk_penalty_current_lambda = 0.0
     total_train_timesteps = total_epochs * cfg.STEPS_PER_EPOCH
     safety_grad_scale = min(
         1.0,
@@ -767,12 +1073,17 @@ def main():
                 "late_gen_lr": late_gen_lr,
                 "late_n_disc_epoch": late_n_disc_epoch,
                 "late_n_disc_updates": late_n_disc_updates,
+                "late_n_disc_ramp_start_epoch": late_n_disc_ramp_start_epoch,
+                "late_n_disc_ramp_end_epoch": late_n_disc_ramp_end_epoch,
                 "best_select_start_epoch": best_select_start_epoch,
                 "save_freq_epochs": save_freq_epochs,
                 "eval_freq_epochs": eval_freq_epochs,
                 "quick_eval_episodes": quick_eval_episodes,
                 "full_eval_episodes": full_eval_episodes,
-                "epoch0_eval_episodes": full_eval_episodes,
+                "full_eval_freq_epochs": full_eval_freq_epochs,
+                "full_eval_pre_end_epoch": full_eval_pre_end_epoch,
+                "full_eval_pre_freq_epochs": full_eval_pre_freq_epochs,
+                "epoch0_eval_episodes": epoch0_eval_episodes,
                 "n_eval_episodes": n_eval_episodes,
                 "goal_bonus": goal_bonus,
                 "attention_query_uses_goal": False,
@@ -784,12 +1095,41 @@ def main():
                 "predictive_safety_residual_enabled": enable_predictive_safety_residual,
                 "predictive_safety_residual_scale": predictive_safety_residual_scale if enable_predictive_safety_residual else 0.0,
                 "predictive_safety_reg_mode": predictive_safety_reg_mode,
+                "predictive_safety_candidate_set": predictive_safety_candidate_set,
+                "predictive_safety_safe_selection": predictive_safety_safe_selection,
+                "predictive_safety_rank_metric": predictive_safety_rank_metric,
+                  "predictive_safety_base_reg_coeff": predictive_safety_base_reg_coeff,
+                  "predictive_safety_gen_penalty": predictive_safety_gen_penalty,
+                  "predictive_safety_gen_penalty_start_epoch": predictive_safety_gen_penalty_start_epoch,
+                  "predictive_safety_gen_penalty_threshold": predictive_safety_gen_penalty_threshold,
+                  "predictive_safety_gen_penalty_clip_min": predictive_safety_gen_penalty_clip_min,
+                  "predictive_safety_gen_penalty_clip_max": predictive_safety_gen_penalty_clip_max,
+                  "predictive_safety_gen_penalty_source": predictive_safety_gen_penalty_source,
+                  "predictive_safety_late_reg_epoch": predictive_safety_late_reg_epoch,
+                "predictive_safety_late_reg_coeff": predictive_safety_late_reg_coeff,
+                "predictive_safety_ramp_reg_start_epoch": predictive_safety_ramp_reg_start_epoch,
+                "predictive_safety_ramp_reg_end_epoch": predictive_safety_ramp_reg_end_epoch,
+                "predictive_safety_enable_cpair_additive": predictive_safety_enable_cpair_additive,
+                "predictive_safety_cpair_additive_start_epoch": predictive_safety_cpair_additive_start_epoch,
+                "predictive_safety_cpair_additive_coeff": predictive_safety_cpair_additive_coeff,
+                "predictive_safety_focused_cpair_enable": predictive_safety_focused_cpair_enable,
+                "predictive_safety_focused_cpair_min_gap": predictive_safety_focused_cpair_min_gap,
+                "predictive_safety_focused_cpair_min_policy_risk": predictive_safety_focused_cpair_min_policy_risk,
+                "predictive_safety_focused_cpair_weight_clip": predictive_safety_focused_cpair_weight_clip,
+                "predictive_safety_focused_cpair_weight_source": predictive_safety_focused_cpair_weight_source,
+                "predictive_safety_late_tiny_cpair_enable": predictive_safety_late_tiny_cpair_enable,
+                "predictive_safety_late_tiny_cpair_start_epoch": predictive_safety_late_tiny_cpair_start_epoch,
+                "predictive_safety_late_tiny_cpair_coeff": predictive_safety_late_tiny_cpair_coeff,
+                "predictive_safety_late_tiny_cpair_candidate_set": predictive_safety_late_tiny_cpair_candidate_set,
+                "predictive_safety_late_tiny_cpair_safe_selection": predictive_safety_late_tiny_cpair_safe_selection,
+                "predictive_safety_late_tiny_cpair_rank_metric": predictive_safety_late_tiny_cpair_rank_metric,
+                "predictive_safety_late_tiny_cpair_margin": predictive_safety_late_tiny_cpair_margin,
                 "safety_fusion_effective": "feature_fusion" if safety_fuse_feature else ("scalar_only" if enable_safety else "disabled"),
                 "safety_embed_dim": safety_embed_dim if enable_safety else 0,
                 "safety_loss_weight_effective": (
                     predictive_safety_reg_coeff
                     if (enable_safety_aux and enable_predictive_safety)
-                    else (cfg.SAFETY_REGULATOR_COEFF if enable_safety_aux else 0.0)
+                    else (predictive_safety_base_reg_coeff if enable_safety_aux else 0.0)
                 ),
                 "reward_normalization_enabled": enable_reward_norm,
                 "reward_normalization_layer": "RunningNorm" if enable_reward_norm else "disabled",
@@ -801,6 +1141,7 @@ def main():
                 "safety_ramp_unfreeze_epochs": safety_ramp_unfreeze_epochs,
                 "safety_decay_epoch": safety_decay_epoch,
                 "safety_decay_lr": safety_decay_lr,
+                "safety_decay_ramp_epochs": safety_decay_ramp_epochs,
                 "safety_decay_grad_scale": safety_decay_grad_scale,
             },
         },
@@ -832,8 +1173,84 @@ def main():
                     "[*] Safety late decay enabled "
                     f"(decay_epoch={safety_decay_epoch}, "
                     f"decay_lr~{safety_decay_lr:.1e}, "
-                    f"decay_grad_scale={safety_decay_grad_scale:.3f})"
+                    f"decay_grad_scale={safety_decay_grad_scale:.3f}, "
+                    f"decay_ramp_epochs={safety_decay_ramp_epochs})"
                 )
+
+    if enable_safety and enable_safety_aux and isinstance(airl_trainer, MildSafetyAIRL) and not predictive_replaces_safety:
+        airl_trainer.set_safety_aux_weights(
+            legacy_weight=safety_aux_current_weight,
+            candidate_pair_additive_weight=safety_cpair_current_weight,
+            late_tiny_candidate_pair_weight=safety_late_tiny_cpair_current_weight,
+        )
+        print(
+            "[*] Safety aux schedule: "
+            f"legacy_base={predictive_safety_base_reg_coeff:.3f}, "
+            f"legacy_late_epoch={predictive_safety_late_reg_epoch}, "
+            f"legacy_late_coeff={predictive_safety_late_reg_coeff:.3f}, "
+            f"legacy_ramp=({predictive_safety_ramp_reg_start_epoch}->{predictive_safety_ramp_reg_end_epoch}), "
+            f"cpair_additive={predictive_safety_enable_cpair_additive}, "
+            f"cpair_start={predictive_safety_cpair_additive_start_epoch}, "
+            f"cpair_coeff={predictive_safety_cpair_additive_coeff:.3f}, "
+            f"late_tiny_cpair={predictive_safety_late_tiny_cpair_enable}, "
+            f"late_tiny_start={predictive_safety_late_tiny_cpair_start_epoch}, "
+            f"late_tiny_coeff={predictive_safety_late_tiny_cpair_coeff:.3f}, "
+            f"late_tiny_set={predictive_safety_late_tiny_cpair_candidate_set}, "
+              f"late_tiny_sel={predictive_safety_late_tiny_cpair_safe_selection}, "
+              f"late_tiny_rank={predictive_safety_late_tiny_cpair_rank_metric}"
+          )
+
+    def update_generator_penalty_for_epoch(epoch_to_train):
+        nonlocal gen_risk_penalty_current_lambda
+        if not hasattr(goal_reward_wrapper, "set_high_risk_penalty"):
+            return
+        next_lambda = 0.0
+        if (
+            enable_predictive_safety_residual
+            and predictive_safety_gen_penalty > 0.0
+            and epoch_to_train >= predictive_safety_gen_penalty_start_epoch
+        ):
+            next_lambda = predictive_safety_gen_penalty
+        if abs(next_lambda - gen_risk_penalty_current_lambda) < 1e-8:
+            return
+        goal_reward_wrapper.set_high_risk_penalty(
+            lambda_risk=next_lambda,
+            threshold=predictive_safety_gen_penalty_threshold,
+            clip_min=predictive_safety_gen_penalty_clip_min,
+            clip_max=predictive_safety_gen_penalty_clip_max,
+            source=predictive_safety_gen_penalty_source,
+        )
+        gen_risk_penalty_current_lambda = next_lambda
+        print(
+            "[*] Generator risk penalty updated "
+            f"(epoch_to_train={epoch_to_train}, lambda={gen_risk_penalty_current_lambda:.4f}, "
+            f"threshold={predictive_safety_gen_penalty_threshold:.2f}, "
+            f"source={predictive_safety_gen_penalty_source}, "
+            f"clip=({predictive_safety_gen_penalty_clip_min:.3f},{predictive_safety_gen_penalty_clip_max:.3f}))"
+        )
+
+    def reset_generator_penalty_stats():
+        if hasattr(goal_reward_wrapper, "reset_high_risk_penalty_stats"):
+            goal_reward_wrapper.reset_high_risk_penalty_stats()
+
+    def get_generator_penalty_stats(reset=False):
+        if hasattr(goal_reward_wrapper, "get_high_risk_penalty_stats"):
+            return goal_reward_wrapper.get_high_risk_penalty_stats(reset=reset)
+        return {
+            "gen_risk_penalty_calls": 0,
+            "gen_risk_penalty_samples": 0,
+            "gen_q_safe_risk_mean": 0.0,
+            "gen_q_safe_risk_max": 0.0,
+            "gen_q_safe_risk_over_threshold_rate": 0.0,
+            "gen_risk_penalty_mean": 0.0,
+            "gen_risk_penalty_abs_mean": 0.0,
+            "gen_risk_penalty_min": 0.0,
+            "gen_risk_penalty_nonzero_rate": 0.0,
+            "gen_risk_penalty_clip_min_rate": 0.0,
+            "gen_risk_penalty_active_lambda": gen_risk_penalty_current_lambda,
+            "gen_risk_penalty_active_threshold": predictive_safety_gen_penalty_threshold,
+            "gen_risk_penalty_source": predictive_safety_gen_penalty_source,
+        }
 
     def update_safety_phase_for_epoch(epoch_to_train):
         nonlocal safety_phase, safety_current_grad_scale
@@ -863,8 +1280,17 @@ def main():
             and safety_decay_grad_scale is not None
             and epoch_to_train >= safety_decay_epoch
         ):
-            next_grad_scale = safety_decay_grad_scale
-            next_phase = "decay_unfreeze"
+            if safety_decay_ramp_epochs and safety_decay_ramp_epochs > 0:
+                decay_fraction = (epoch_to_train - safety_decay_epoch) / float(safety_decay_ramp_epochs)
+                decay_fraction = min(1.0, max(0.0, decay_fraction))
+                next_grad_scale = (
+                    safety_grad_scale
+                    + decay_fraction * (safety_decay_grad_scale - safety_grad_scale)
+                )
+                next_phase = "decay_ramp_unfreeze" if decay_fraction < 1.0 else "decay_unfreeze"
+            else:
+                next_grad_scale = safety_decay_grad_scale
+                next_phase = "decay_unfreeze"
 
         if next_grad_scale <= 0.0:
             return
@@ -880,19 +1306,125 @@ def main():
             f"grad_scale={safety_current_grad_scale:.3f})"
         )
 
+    def update_safety_aux_schedule_for_epoch(epoch_to_train):
+        nonlocal safety_aux_current_weight, safety_cpair_current_weight, safety_late_tiny_cpair_current_weight
+        if not (
+            enable_safety
+            and enable_safety_aux
+            and isinstance(airl_trainer, MildSafetyAIRL)
+            and not predictive_replaces_safety
+        ):
+            return
+
+        next_legacy_weight = predictive_safety_base_reg_coeff
+        if (
+            predictive_safety_ramp_reg_start_epoch is not None
+            and predictive_safety_ramp_reg_end_epoch is not None
+            and predictive_safety_ramp_reg_end_epoch > predictive_safety_ramp_reg_start_epoch
+        ):
+            if epoch_to_train >= predictive_safety_ramp_reg_end_epoch:
+                next_legacy_weight = predictive_safety_late_reg_coeff
+            elif epoch_to_train >= predictive_safety_ramp_reg_start_epoch:
+                ramp_fraction = (
+                    (epoch_to_train - predictive_safety_ramp_reg_start_epoch)
+                    / float(predictive_safety_ramp_reg_end_epoch - predictive_safety_ramp_reg_start_epoch)
+                )
+                ramp_fraction = min(1.0, max(0.0, ramp_fraction))
+                next_legacy_weight = (
+                    predictive_safety_base_reg_coeff
+                    + ramp_fraction * (predictive_safety_late_reg_coeff - predictive_safety_base_reg_coeff)
+                )
+        elif (
+            predictive_safety_late_reg_epoch is not None
+            and epoch_to_train >= predictive_safety_late_reg_epoch
+        ):
+            next_legacy_weight = predictive_safety_late_reg_coeff
+
+        next_cpair_weight = 0.0
+        if (
+            enable_predictive_safety_residual
+            and predictive_safety_enable_cpair_additive
+            and epoch_to_train >= predictive_safety_cpair_additive_start_epoch
+        ):
+            next_cpair_weight = predictive_safety_cpair_additive_coeff
+
+        next_late_tiny_cpair_weight = 0.0
+        if (
+            enable_predictive_safety_residual
+            and predictive_safety_late_tiny_cpair_enable
+            and epoch_to_train >= predictive_safety_late_tiny_cpair_start_epoch
+        ):
+            next_late_tiny_cpair_weight = predictive_safety_late_tiny_cpair_coeff
+
+        if (
+            abs(next_legacy_weight - safety_aux_current_weight) < 1e-8
+            and abs(next_cpair_weight - safety_cpair_current_weight) < 1e-8
+            and abs(next_late_tiny_cpair_weight - safety_late_tiny_cpair_current_weight) < 1e-8
+        ):
+            return
+
+        airl_trainer.set_safety_aux_weights(
+            legacy_weight=next_legacy_weight,
+            candidate_pair_additive_weight=next_cpair_weight,
+            late_tiny_candidate_pair_weight=next_late_tiny_cpair_weight,
+        )
+        cfg.SAFETY_REGULATOR_COEFF = next_legacy_weight
+        safety_aux_current_weight = next_legacy_weight
+        safety_cpair_current_weight = next_cpair_weight
+        safety_late_tiny_cpair_current_weight = next_late_tiny_cpair_weight
+        print(
+            "[*] Safety aux schedule updated "
+            f"(epoch_to_train={epoch_to_train}, "
+            f"legacy_weight={safety_aux_current_weight:.3f}, "
+            f"cpair_additive_weight={safety_cpair_current_weight:.3f}, "
+            f"late_tiny_cpair_weight={safety_late_tiny_cpair_current_weight:.3f})"
+        )
+
+    def get_n_disc_updates_for_epoch(epoch_to_train):
+        if late_n_disc_updates is None:
+            return base_n_disc_updates
+
+        if (
+            late_n_disc_ramp_start_epoch is not None
+            and late_n_disc_ramp_end_epoch is not None
+            and late_n_disc_ramp_end_epoch > late_n_disc_ramp_start_epoch
+        ):
+            if epoch_to_train <= late_n_disc_ramp_start_epoch:
+                return base_n_disc_updates
+            if epoch_to_train >= late_n_disc_ramp_end_epoch:
+                return late_n_disc_updates
+
+            span = late_n_disc_ramp_end_epoch - late_n_disc_ramp_start_epoch
+            elapsed = epoch_to_train - late_n_disc_ramp_start_epoch
+            late_fraction = min(1.0, max(0.0, elapsed / float(span)))
+            if late_n_disc_updates == base_n_disc_updates:
+                return base_n_disc_updates
+
+            phase = ((elapsed * 37) % span) / float(span)
+            use_late = phase < late_fraction
+            return late_n_disc_updates if use_late else base_n_disc_updates
+
+        if late_n_disc_epoch is not None and epoch_to_train > late_n_disc_epoch:
+            return late_n_disc_updates
+        return base_n_disc_updates
+
     train_mode = "S-AIRL" if enable_safety else "GC-AIRL no-safety ablation"
     print(f"[*] 开始 {train_mode} 训练...")
     print(
         f"[*] 配置: total_epochs={total_epochs}, "
         f"eval_every={eval_freq_epochs} epoch, save_every={save_freq_epochs} epochs, "
-        f"quick_eval_episodes={quick_eval_episodes}, full_eval_episodes={full_eval_episodes}"
+        f"quick_eval_episodes={quick_eval_episodes}, full_eval_episodes={full_eval_episodes}, "
+        f"full_eval_pre=1-{full_eval_pre_end_epoch}:{full_eval_pre_freq_epochs} epoch, "
+        f"full_eval_post={full_eval_freq_epochs} epoch, epoch0_eval_episodes={epoch0_eval_episodes}"
     )
+    update_generator_penalty_for_epoch(1)
+    reset_generator_penalty_stats()
     
     epoch0_metrics = evaluate_policy_metrics(
         learner,
         val_dataset,
         cfg,
-        n_eval_episodes=full_eval_episodes,
+        n_eval_episodes=epoch0_eval_episodes,
     )
     append_eval_metrics(
         log_dir,
@@ -901,13 +1433,18 @@ def main():
             "total_timesteps": learner.num_timesteps,
             "generator_lr": base_gen_lr,
             "safety_phase": safety_phase,
-            "eval_n_episodes": full_eval_episodes,
+            "safety_aux_weight": safety_aux_current_weight,
+            "safety_cpair_additive_weight": safety_cpair_current_weight,
+            "safety_late_tiny_cpair_weight": safety_late_tiny_cpair_current_weight,
+            "gen_risk_penalty_lambda": gen_risk_penalty_current_lambda,
+            "eval_n_episodes": epoch0_eval_episodes,
+            **get_generator_penalty_stats(reset=True),
             **epoch0_metrics,
         },
     )
     print(
         "[*] Epoch 0 eval | "
-        f"episodes={full_eval_episodes}, "
+        f"episodes={epoch0_eval_episodes}, "
         f"dense_norm100={epoch0_metrics['eval_dense_return_norm100']:.2f}, "
         f"paper_rank={epoch0_metrics['paper_rank_score_mean']:.2f}, "
         f"merge={epoch0_metrics['merge_success_rate']:.3f}, "
@@ -918,11 +1455,11 @@ def main():
 
     def build_best_key(metrics):
         return (
-            float(metrics.get("eval_ep_rew_mean", float("-inf"))),
-            float(metrics.get("safety_success_rate", float("-inf"))),
             -float(metrics.get("collision_rate", float("inf"))),
+            float(metrics.get("safety_success_rate", float("-inf"))),
             float(metrics.get("merge_success_rate", float("-inf"))),
             float(metrics.get("endpoint_success_rate", float("-inf"))),
+            float(metrics.get("eval_ep_rew_mean", float("-inf"))),
         )
 
     best_checkpoint_key = None
@@ -938,19 +1475,23 @@ def main():
         if late_gen_lr_epoch is not None and late_gen_lr is not None and chunk_start_epoch > late_gen_lr_epoch:
             current_lr = late_gen_lr
         learner.lr_schedule = lambda _: current_lr
-        current_n_disc_updates = base_n_disc_updates
-        if late_n_disc_epoch is not None and late_n_disc_updates is not None and chunk_start_epoch > late_n_disc_epoch:
-            current_n_disc_updates = late_n_disc_updates
+        current_n_disc_updates = get_n_disc_updates_for_epoch(chunk_start_epoch)
         if hasattr(airl_trainer, "n_disc_updates_per_round"):
             airl_trainer.n_disc_updates_per_round = current_n_disc_updates
         update_safety_phase_for_epoch(chunk_start_epoch)
+        update_safety_aux_schedule_for_epoch(chunk_start_epoch)
+        update_generator_penalty_for_epoch(chunk_start_epoch)
+        reset_generator_penalty_stats()
         # ==========================================
         
         last_eval_metrics = {}
 
         def eval_callback(round_idx):
             current_eval_epoch = chunk * save_freq_epochs + round_idx + 1
-            is_full_eval = (current_eval_epoch % save_freq_epochs == 0)
+            active_full_eval_freq = full_eval_freq_epochs
+            if full_eval_pre_end_epoch > 0 and current_eval_epoch <= full_eval_pre_end_epoch:
+                active_full_eval_freq = full_eval_pre_freq_epochs
+            is_full_eval = (current_eval_epoch % active_full_eval_freq == 0)
             eval_episodes = full_eval_episodes if is_full_eval else quick_eval_episodes
             eval_metrics = evaluate_policy_metrics(
                 learner,
@@ -958,12 +1499,18 @@ def main():
                 cfg,
                 n_eval_episodes=eval_episodes,
             )
+            gen_penalty_stats = get_generator_penalty_stats(reset=True)
             eval_row = {
                 "epoch": current_eval_epoch,
                 "total_timesteps": learner.num_timesteps,
                 "generator_lr": current_lr,
                 "safety_phase": safety_phase,
+                "safety_aux_weight": safety_aux_current_weight,
+                "safety_cpair_additive_weight": safety_cpair_current_weight,
+                "safety_late_tiny_cpair_weight": safety_late_tiny_cpair_current_weight,
+                "gen_risk_penalty_lambda": gen_risk_penalty_current_lambda,
                 "eval_n_episodes": eval_episodes,
+                **gen_penalty_stats,
                 **eval_metrics,
             }
             append_eval_metrics(log_dir, eval_row)
@@ -978,17 +1525,30 @@ def main():
                 f"merge={eval_metrics['merge_success_rate']:.3f}, "
                 f"endpoint={eval_metrics['endpoint_success_rate']:.3f}, "
                 f"safety={eval_metrics['safety_success_rate']:.3f}, "
-                f"collision={eval_metrics['collision_rate']:.3f}"
+                f"collision={eval_metrics['collision_rate']:.3f}, "
+                f"gen_risk_mean={gen_penalty_stats['gen_q_safe_risk_mean']:.3f}, "
+                f"gen_risk>thr={gen_penalty_stats['gen_q_safe_risk_over_threshold_rate']:.3f}, "
+                f"gen_penalty_nonzero={gen_penalty_stats['gen_risk_penalty_nonzero_rate']:.3f}, "
+                f"gen_penalty_mean={gen_penalty_stats['gen_risk_penalty_mean']:.6f}"
             )
             next_train_epoch = current_eval_epoch + 1
             if next_train_epoch <= total_epochs:
                 update_safety_phase_for_epoch(next_train_epoch)
+                update_safety_aux_schedule_for_epoch(next_train_epoch)
+                update_generator_penalty_for_epoch(next_train_epoch)
 
         airl_trainer.train(total_timesteps=steps_per_chunk, callback=eval_callback)
         current_epoch = (chunk + 1) * save_freq_epochs
 
         # 在存档名中也加入架构标记
-        checkpoint_path = os.path.join(checkpoint_dir, f"baseline_policy_{run_label}_epoch_{current_epoch}.zip")
+        checkpoint_path = build_safe_checkpoint_path(
+            checkpoint_dir,
+            run_label,
+            probe_tag=probe_tag,
+            prefix="baseline_policy",
+            suffix="epoch",
+            epoch=current_epoch,
+        )
         learner.save(checkpoint_path)
         eval_metrics = last_eval_metrics
         if current_epoch >= best_select_start_epoch:
@@ -996,9 +1556,13 @@ def main():
             if best_checkpoint_key is None or current_best_key > best_checkpoint_key:
                 best_checkpoint_key = current_best_key
                 best_checkpoint_epoch = current_epoch
-                best_checkpoint_path = os.path.join(
+                best_checkpoint_path = build_safe_checkpoint_path(
                     checkpoint_dir,
-                    f"baseline_policy_{run_label}_best_epoch_{current_epoch}.zip",
+                    run_label,
+                    probe_tag=probe_tag,
+                    prefix="baseline_policy",
+                    suffix="best_epoch",
+                    epoch=current_epoch,
                 )
                 learner.save(best_checkpoint_path)
                 print(f"[*] Best checkpoint updated -> {best_checkpoint_path}")
@@ -1027,7 +1591,13 @@ def main():
     # ==========================================
     # 5. 保存最终模型
     # ==========================================
-    final_checkpoint_path = os.path.join(checkpoint_dir, f"airl_policy_baseline_{run_label}_final.zip")
+    final_checkpoint_path = build_safe_checkpoint_path(
+        checkpoint_dir,
+        run_label,
+        probe_tag=probe_tag,
+        prefix="airl_policy_baseline",
+        suffix="final",
+    )
     learner.save(final_checkpoint_path)
     print(f"\n训练全部完成，最终策略已保存为 {final_checkpoint_path}。")
 

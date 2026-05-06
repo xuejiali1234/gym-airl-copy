@@ -1,0 +1,241 @@
+我建议你**不要为了让 150～260 的曲线更“好看”而大改 P30**。P30 的核心价值就是：前中期对抗训练比较乱，但在 `270` 以后进入了一个可选模型窗口；你的 `best_select_start_epoch=270` 本来就等于承认了前面是 burn-in / adversarial settling 阶段。P30 配置里正好是 `CPair additive=0.03 from epoch 1`、`U220`、`D230 -> 4`、`Decay250`、`best_select_start_epoch=270` 这一整套后期稳定框架。
+
+## 1. 先看 P30 的“不稳定”到底是什么
+
+我读了这次上传的 `progress(1).csv / eval_metrics(1).csv`。比较关键的是：
+
+```text
+150~219:
+  disc_acc      ≈ 0.655 ± 0.120
+  reward_gap    ≈ 1.04 ± 0.72
+  value_loss    ≈ 547 ± 499
+  eval collision≈ 0.50 ± 0.24
+
+270~300:
+  disc_acc      ≈ 0.484 ± 0.030
+  reward_gap    ≈ 0.168 ± 0.091
+  value_loss    ≈ 42.7 ± 24.6
+  explained_var ≈ 0.976
+```
+
+这说明 150～219 期间确实是判别器明显占优、reward gap 大、policy value 还没稳；但到 270 以后，对抗准确率已经回到接近 0.5，reward gap 也明显收缩。这不是训练炸了，而是 AIRL 对抗训练从“判别器压制策略”逐渐走到“生成器和专家分布接近”的过程。
+
+不过要纠正一点：**270～300 的训练内部曲线稳定，但 eval 性能真正稳定的是 292～298 这个窄窗口，不是整个 270～300。** 例如：
+
+```text
+P30 @292:
+  merge=0.91, endpoint=0.98, safety=0.94, collision=0.04
+
+P30 @295:
+  merge=0.94, endpoint=0.98, safety=0.94, collision=0.04
+
+P30 @298:
+  merge=0.89, endpoint=0.96, safety=0.93, collision=0.03
+
+P30 @300:
+  merge=0.40, endpoint=0.64, safety=0.61, collision=0.03
+```
+
+所以现在应该继续保留“best checkpoint”逻辑，不要把 300 轮终点当主模型。
+
+## 2. 论文展示上，最稳做法是“分阶段 + 平滑”，不是重训
+
+如果你的主要担心是图不好看，我建议这样处理：
+
+```text
+1. 主结果仍用 P30 @298 / P30 @292；
+2. 训练曲线画 raw + EMA 平滑线；
+3. 图上标出 U220、D230、Decay250、Selection start=270；
+4. caption 里说明 270 前是 adversarial warm-up / safety settling phase；
+5. 主表用 fixed protocol，不靠训练曲线证明最终性能。
+```
+
+可以用：
+
+```text
+EMA span = 7 或 10
+或者 rolling mean window = 5
+```
+
+图不要只放平滑线，最好淡色放 raw，深色放 EMA。这样既不隐藏波动，也不会让读者被 150～260 的对抗波动带偏。
+
+这比重新调参安全得多。因为历史调参已经反复证明，很多“让曲线看起来更顺”的操作会伤最终指标：reward normalization 不推荐，降低 discriminator lr 没收益，feature fusion 变差，继续加大 safety 强度也容易让策略保守。
+
+## 3. 当前主模型还是 P30，不建议为了美观换掉
+
+fixed protocol 下，当前仍然应该这样定：
+
+```text
+P30 @298:
+  full217 safety-first reference
+  collision = 26/217
+  endpoint = 0.959
+  hard15 = 11/15
+
+P30 @292:
+  balance / hard15 reference
+  full217 collision = 31/217
+  hard15 = 10/15
+```
+
+P30 @298 是 full217 safety-first；P30 @292 是 hard15 相对更稳。P30 @295 训练内很好看，但 fixed protocol 没有压过 @292/@298。
+
+所以如果你问“要不要直接用 P30”，我的答案是：**要，用 P30；不要为了让 150～260 更平滑而牺牲 P30 的 292～298 窗口。**
+
+## 4. 如果一定要训练一个“曲线更稳版”，只做低风险 schedule 探针
+
+如果你确实想试一个更平滑的 P30 版本，我建议不要动安全模块、不动 CPair、不动 reward penalty、不动 PPO。只做 **schedule smoothing**。
+
+### 首选探针：P45_P30_SmoothTransitions
+
+目标是把几个硬切换变成过渡，而不是改目标函数。
+
+```text
+P45_P30_SmoothTransitions
+
+base:
+  完全使用 P30 底座
+  residual_scale = 0.5
+  legacy aux = 0
+  current CPair additive = 0.03
+  CPair start epoch = 1
+  candidate_set = current
+  safe_selection = min_risk
+  rank_metric = clipped
+  no generator penalty
+  no CandidateV2
+  no focused CPair
+  no reward normalization
+  no PPO/LR 改动
+
+schedule smoothing:
+  safety unfreeze:
+    220~240 从 very-light 逐渐过渡到原 5e-6
+    例如 220: 1e-6，230: 2.5e-6，240: 5e-6
+
+  discriminator updates:
+    210~230 做 D5/D4 过渡
+    如果代码不支持连续过渡，就先用 late_n_disc_epoch=220
+
+  safety decay:
+    250~270 把 grad_scale 从 1.0 线性降到 0.05
+    safety lr 从 5e-6 线性降到 2.5e-6
+```
+
+这个探针的核心是：**不要改变 P30 的最终机制，只让 U220 / D230 / Decay250 附近不那么突然。**
+
+### 无代码改动备选：P45b_P30_D220
+
+如果你不想写 ramp，只跑最小改动：
+
+```text
+P45b_P30_D220
+
+只改：
+  PROBE_LATE_N_DISC_EPOCH = 220
+  PROBE_LATE_N_DISC_UPDATES = 4
+
+保持：
+  Decay250
+  CPair additive 0.03
+  residual 0.5
+  best_select_start_epoch = 270
+```
+
+它的目的不是提高性能，而是看能不能让 220～260 的 discriminator / reward gap 更早收住。缺点是：D4 提前可能削弱判别器压力，最终性能可能不如 P30。
+
+### 第二备选：P46_P30_Decay245
+
+```text
+P46_P30_Decay245
+
+只改：
+  PROBE_SAFETY_DECAY_EPOCH = 245
+
+保持：
+  late_n_disc_epoch = 230
+  safety_decay_lr = 2.5e-6
+  safety_decay_grad_scale = 0.05
+  其他完全同 P30
+```
+
+这个探针的目标是把 270 后的稳定窗口稍微前移。但它也有风险：P30 的好点来自 Decay250 后约 40～50 epoch 的自然收敛，Decay 提前不一定保留 @292/@298 的强点。
+
+## 5. 我更推荐“不重训，只改展示”
+
+如果目标是论文美观，我会优先做：
+
+```text
+方案 A：不用重训
+  P30 @298 / @292 作为最终模型
+  曲线使用 EMA 平滑
+  图上标注 training phases
+  表格使用 fixed protocol 结果
+```
+
+如果目标是实际训练更平稳，再跑：
+
+```text
+方案 B：只跑一组
+  P45b_P30_D220
+
+方案 C：可以改 schedule 代码
+  P45_P30_SmoothTransitions
+```
+
+但要设定清楚验收标准：
+
+```text
+不能只看曲线更平滑；
+必须同时满足：
+
+1. P30 @298 reference:
+   full217 collision <= 26/217 附近
+   endpoint >= 0.95
+
+2. P30 @292 reference:
+   hard15 <= 10/15 附近
+
+3. 训练内 292~298 不能消失
+```
+
+如果新探针曲线更漂亮，但 fixed protocol 不如 P30，就不要换主模型。
+
+## 6. 不建议做的事
+
+现在不要为了平滑曲线去做这些：
+
+```text
+1. 不要开 reward normalization；
+2. 不要降低 discriminator lr 到 4e-5；
+3. 不要改 PPO_EPOCHS / batch size / generator lr；
+4. 不要加 generator risk penalty；
+5. 不要回到 CandidateV2 / task_safe / raw-rank；
+6. 不要提高 CPair coeff 到 0.06；
+7. 不要把 P30 @300 当终点模型。
+```
+
+这些方向前面基本都验证过，不是收益低，就是会打坏 P30 的后期甜点。
+
+## 最终建议
+
+我会这样处理：
+
+```text
+主结果：
+  P30 @298
+
+补充候选：
+  P30 @292
+
+论文曲线：
+  raw + EMA smoothing
+  标注 U220 / D230 / Decay250 / selection start=270
+  说明 270 前是 adversarial settling phase
+
+如果一定重训：
+  先跑 P45b_P30_D220
+  或者写 ramp 后跑 P45_P30_SmoothTransitions
+```
+
+一句话：**P30 的 150～260 不稳定不是主模型失败，而是对抗训练和后期 safety schedule 进入稳定区前的自然过渡；为了性能，优先保留 P30，用阶段标注和平滑曲线解决展示问题。**
