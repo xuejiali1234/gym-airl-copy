@@ -120,6 +120,10 @@ def convert_to_trajectories(dataset, cfg):
     """将专家数据打包，并根据 Config 决定是否将 goal 拼接到 state 中"""
     trajectories = []
     enable_goal = getattr(cfg, 'ENABLE_GOAL_CONDITION', False)
+    goal_mode = str(getattr(cfg, "GOAL_ABLATION_MODE", "normal")).lower()
+    if goal_mode not in {"normal", "zero", "drop"}:
+        raise ValueError(f"Unknown GOAL_ABLATION_MODE: {goal_mode}")
+    append_goal = enable_goal and goal_mode != "drop"
     
     for traj in dataset.trajectories:
         obs = traj['state']
@@ -130,8 +134,10 @@ def convert_to_trajectories(dataset, cfg):
         full_obs = np.concatenate([obs, final_next_state], axis=0)
         
         # 如果开启 Goal，处理 Goal 并拼接到 State 后面
-        if enable_goal:
+        if append_goal:
             obs_goal = traj['goal']
+            if goal_mode == "zero":
+                obs_goal = np.zeros_like(obs_goal)
             final_goal = obs_goal[-1].reshape(1, -1)
             full_obs_goal = np.concatenate([obs_goal, final_goal], axis=0)
             
@@ -165,7 +171,7 @@ def split_dataset(dataset, train_ratio=0.8, seed=42):
 
 def evaluate_policy_metrics(model, dataset, cfg, n_eval_episodes=20):
     """Runs policy evaluation without changing the training reward path."""
-    eval_env = MergingEnv(dataset)
+    eval_env = MergingEnv(dataset, cfg)
     merge_successes = []
     endpoint_successes = []
     safety_successes = []
@@ -325,6 +331,20 @@ def apply_probe_overrides(cfg):
     set_if_present("PROBE_SAFETY_DECAY_LR", "PROBE_SAFETY_DECAY_LR", float)
     set_if_present("PROBE_SAFETY_DECAY_RAMP_EPOCHS", "PROBE_SAFETY_DECAY_RAMP_EPOCHS", int)
     set_if_present("PROBE_SAFETY_EMBED_DIM", "SAFETY_EMBED_DIM", int)
+    for env_name, attr_name in (
+        ("PROBE_ENABLE_ATTENTION", "ENABLE_ATTENTION"),
+        ("PROBE_ENABLE_GOAL_CONDITION", "ENABLE_GOAL_CONDITION"),
+        ("PROBE_ENABLE_SAFETY_MODULE", "ENABLE_SAFETY_MODULE"),
+        ("PROBE_ENABLE_SAFETY_BRANCH", "ENABLE_SAFETY_BRANCH"),
+        ("PROBE_ENABLE_SAFETY_AUX_LOSS", "ENABLE_SAFETY_AUX_LOSS"),
+        ("PROBE_DEBUG_USE_GROUND_TRUTH_REWARD", "DEBUG_USE_GROUND_TRUTH_REWARD"),
+    ):
+        bool_value = parse_env_bool(env_name)
+        if bool_value is not None:
+            setattr(cfg, attr_name, bool_value)
+            overrides[attr_name] = bool_value
+    set_if_present("PROBE_ATTENTION_ABLATION_MODE", "ATTENTION_ABLATION_MODE", str)
+    set_if_present("PROBE_GOAL_ABLATION_MODE", "GOAL_ABLATION_MODE", str)
     set_if_present("PROBE_SAFETY_ORACLE_TTC_THRESHOLD", "SAFETY_ORACLE_TTC_THRESHOLD", float)
     set_if_present("PROBE_SAFETY_ORACLE_WARNING_TTC_THRESHOLD", "SAFETY_ORACLE_WARNING_TTC_THRESHOLD", float)
     set_if_present("PROBE_SAFETY_ORACLE_WARNING_WEIGHT", "SAFETY_ORACLE_WARNING_WEIGHT", float)
@@ -506,11 +526,18 @@ def main():
     # ---------------------------------------------------------
     enable_attention = getattr(cfg, 'ENABLE_ATTENTION', False)
     enable_goal = getattr(cfg, 'ENABLE_GOAL_CONDITION', False)
+    attention_ablation_mode = str(getattr(cfg, "ATTENTION_ABLATION_MODE", "normal")).lower()
+    goal_ablation_mode = str(getattr(cfg, "GOAL_ABLATION_MODE", "normal")).lower()
+    if attention_ablation_mode not in {"normal", "zero"}:
+        raise ValueError(f"Unknown ATTENTION_ABLATION_MODE: {attention_ablation_mode}")
+    if goal_ablation_mode not in {"normal", "zero", "drop"}:
+        raise ValueError(f"Unknown GOAL_ABLATION_MODE: {goal_ablation_mode}")
+    append_goal = enable_goal and goal_ablation_mode != "drop"
     enable_safety = getattr(cfg, "ENABLE_SAFETY_MODULE", False)
     enable_safety_branch = enable_safety and getattr(cfg, "ENABLE_SAFETY_BRANCH", True)
     enable_safety_aux = enable_safety and getattr(cfg, "ENABLE_SAFETY_AUX_LOSS", True)
     enable_predictive_safety = enable_safety_branch and getattr(cfg, "ENABLE_PREDICTIVE_SAFETY_CRITIC", False)
-    enable_predictive_safety_residual = enable_safety_branch and getattr(cfg, "ENABLE_PREDICTIVE_SAFETY_RESIDUAL", False)
+    enable_predictive_safety_residual = enable_safety and getattr(cfg, "ENABLE_PREDICTIVE_SAFETY_RESIDUAL", False)
     predictive_replaces_safety = enable_predictive_safety and not enable_predictive_safety_residual
     use_predictive_safety = enable_predictive_safety or enable_predictive_safety_residual
     enable_reward_norm = getattr(cfg, "ENABLE_REWARD_NORMALIZATION", False)
@@ -607,8 +634,11 @@ def main():
     os.makedirs("checkpoints", exist_ok=True)
     
     # 在日志名中加入 attention 标记，方便对比
-    arch_str = "attn" if enable_attention else "mlp"
-    goal_str = "goal" if enable_goal else "nogoal"
+    arch_str = "attnzero" if (enable_attention and attention_ablation_mode == "zero") else ("attn" if enable_attention else "mlp")
+    if append_goal:
+        goal_str = "goalzero" if goal_ablation_mode == "zero" else "goal"
+    else:
+        goal_str = "goaldrop" if (enable_goal and goal_ablation_mode == "drop") else "nogoal"
     if enable_safety:
         safety_prior_str = "safe_branch" if enable_safety_branch else "zero_branch"
         safety_aux_str = "aux" if enable_safety_aux else "noaux"
@@ -631,6 +661,8 @@ def main():
     custom_logger = init_logger(folder=log_dir, format_strs=["stdout", "csv", "log"])
     print(f"[*] 日志系统已就绪，所有训练数据将保存在: {log_dir}")
     print(f"[*] 当前网络架构: {'Attention (跳跃拼接)' if enable_attention else 'Pure MLP'}")
+    print(f"[*] Effective attention mode: {attention_ablation_mode if enable_attention else 'disabled'}")
+    print(f"[*] Effective goal mode: {goal_ablation_mode if enable_goal else 'disabled'} (append_goal={append_goal})")
     print(f"[*] Repro seed={cfg.SEED}, deterministic={deterministic_training}")
     if probe_tag:
         print(f"[*] Probe tag: {probe_tag}")
@@ -791,12 +823,40 @@ def main():
                 feature_dim=128,
                 use_action=getattr(cfg, "SAFETY_USE_ACTION", True),
             )
+            if enable_predictive_safety_residual:
+                print("[*] Pretraining predictive residual safety network (zero old safety branch)...")
+                predictive_safety_oracle = PredictiveSafetyOracle(
+                    cfg,
+                    train_dataset.expert_mean,
+                    train_dataset.expert_std,
+                    horizon_steps=predictive_safety_horizon_steps,
+                    dt=predictive_safety_dt,
+                )
+                predictive_safety_net = PredictiveSafetyCostNetwork(
+                    state_dim=16,
+                    action_dim=2,
+                    hidden_dim=128,
+                    use_action=getattr(cfg, "SAFETY_USE_ACTION", True),
+                )
+                predictive_pretrain_stats = pretrain_predictive_safety_network(
+                    predictive_safety_net,
+                    train_dataset,
+                    predictive_safety_oracle,
+                    device=device,
+                    epochs=15,
+                    batch_size=512,
+                    lr=cfg.SAFETY_LEARNING_RATE,
+                    use_candidates=predictive_safety_use_candidates,
+                    seed=cfg.SEED,
+                    verbose=True,
+                )
+                print(f"[*] Predictive residual pretrain done: {predictive_pretrain_stats}")
 
     # ==========================================
     # 3. 初始化环境与网络
     # ==========================================
     def make_train_env():
-        raw_env = MergingEnv(train_dataset)
+        raw_env = MergingEnv(train_dataset, cfg)
         return Monitor(
             raw_env,
             info_keywords=("is_success", "is_merge_success", "is_endpoint_success", "is_safety_success"),
@@ -804,6 +864,13 @@ def main():
 
     env = DummyVecEnv([make_train_env])
     env.seed(cfg.SEED)
+    expert_obs_dim = int(expert_trajectories[0].obs.shape[1])
+    env_obs_dim = int(env.observation_space.shape[0])
+    if env_obs_dim != expert_obs_dim:
+        raise ValueError(
+            f"Observation dim mismatch: env={env_obs_dim}, expert={expert_obs_dim}. "
+            f"ENABLE_GOAL_CONDITION={enable_goal}, GOAL_ABLATION_MODE={goal_ablation_mode}"
+        )
     divider_x = cfg.X_MIN + cfg.LANE_WIDTH
     goal_bonus = 0.5
 
@@ -824,6 +891,7 @@ def main():
                 action_space=env.action_space,
                 safety_net=safety_net,
                 hidden_dim=64,
+                attention_ablation_mode=attention_ablation_mode,
                 safety_embed_dim=safety_embed_dim,
                 freeze_safety=True,
                 fuse_safety_feature=safety_fuse_feature,
@@ -835,7 +903,8 @@ def main():
             base_reward_net = AttentionRewardNet(
                 observation_space=env.observation_space,
                 action_space=env.action_space,
-                hidden_dim=64  # 注意力输出维度
+                hidden_dim=64,  # 注意力输出维度
+                attention_ablation_mode=attention_ablation_mode,
             )
         reward_net = GoalRewardWrapper(
             base_reward_net,
@@ -855,7 +924,10 @@ def main():
         # 2. 生成器 (PPO)：提取特征后，送入严格对齐的 128x128 网络
         policy_kwargs = dict(
             features_extractor_class=AttentionFeaturesExtractor,
-            features_extractor_kwargs=dict(hidden_dim=64),
+            features_extractor_kwargs=dict(
+                hidden_dim=64,
+                attention_ablation_mode=attention_ablation_mode,
+            ),
             net_arch=dict(pi=[128, 128], vf=[128, 128]), # <--- 绝对对齐
             activation_fn=nn.Tanh
         )
@@ -909,7 +981,7 @@ def main():
             activation_fn=nn.Tanh,  
             net_arch=dict(pi=[128, 128], vf=[128, 128])  # <--- 绝对对齐
         )
-        if enable_goal:
+        if append_goal:
             policy_kwargs.update(
                 dict(
                     features_extractor_class=GoalConditionedMLPFeaturesExtractor,
@@ -922,6 +994,11 @@ def main():
                 )
             )
     # ---------------------------------------------------------
+
+    policy_features_extractor_cls = policy_kwargs.get("features_extractor_class")
+    policy_features_extractor_class = (
+        policy_features_extractor_cls.__name__ if policy_features_extractor_cls is not None else "FlattenExtractor"
+    )
 
     if enable_reward_norm:
         reward_net = NormalizedRewardNet(reward_net, normalize_output_layer=RunningNorm)
@@ -958,11 +1035,26 @@ def main():
             weight_decay=1e-3,
         ),
     )
+
+    def compute_cpair_additive_weight(epoch_to_train):
+        if not (enable_predictive_safety_residual and predictive_safety_enable_cpair_additive):
+            return 0.0
+        if epoch_to_train < predictive_safety_cpair_additive_start_epoch:
+            return 0.0
+        return float(predictive_safety_cpair_additive_coeff)
+
+    def compute_late_tiny_cpair_weight(epoch_to_train):
+        if not (enable_predictive_safety_residual and predictive_safety_late_tiny_cpair_enable):
+            return 0.0
+        if epoch_to_train < predictive_safety_late_tiny_cpair_start_epoch:
+            return 0.0
+        return float(predictive_safety_late_tiny_cpair_coeff)
+
     if enable_safety:
         safety_loss_weight = 0.0
         safety_reg_mode = "legacy_aux"
-        safety_cpair_additive_weight = 0.0
-        safety_late_tiny_cpair_weight = 0.0
+        safety_cpair_additive_weight = compute_cpair_additive_weight(0)
+        safety_late_tiny_cpair_weight = compute_late_tiny_cpair_weight(0)
         if enable_safety_aux:
             if enable_predictive_safety and not enable_predictive_safety_residual:
                 safety_loss_weight = predictive_safety_reg_coeff
@@ -970,8 +1062,6 @@ def main():
             else:
                 safety_loss_weight = predictive_safety_base_reg_coeff
                 safety_reg_mode = "legacy_aux"
-                if enable_predictive_safety_residual and predictive_safety_enable_cpair_additive:
-                    safety_cpair_additive_weight = 0.0
         airl_trainer = MildSafetyAIRL(
             **trainer_kwargs,
             safety_loss_weight=safety_loss_weight,
@@ -1089,7 +1179,23 @@ def main():
                 "attention_query_uses_goal": False,
                 "safety_enabled": enable_safety,
                 "safety_branch_enabled": enable_safety_branch,
+                "safety_branch_type": "none" if not enable_safety else ("real" if enable_safety_branch else "zero"),
                 "safety_aux_enabled": enable_safety_aux,
+                "trainer_class": type(airl_trainer).__name__,
+                "reward_net_class": type(reward_net).__name__,
+                "base_reward_net_class": type(base_reward_net).__name__,
+                "policy_features_extractor_class": policy_features_extractor_class,
+                "observation_dim": env_obs_dim,
+                "expert_observation_dim": expert_obs_dim,
+                "enable_attention": enable_attention,
+                "effective_attention_mode": attention_ablation_mode if enable_attention else "disabled",
+                "enable_goal_condition": enable_goal,
+                "effective_goal_mode": goal_ablation_mode if enable_goal else "disabled",
+                "append_goal": append_goal,
+                "safety_net_class": type(safety_net).__name__ if safety_net is not None else "None",
+                "predictive_safety_net_class": (
+                    type(predictive_safety_net).__name__ if predictive_safety_net is not None else "None"
+                ),
                 "predictive_safety_enabled": use_predictive_safety,
                 "predictive_safety_replaces_safety": predictive_replaces_safety,
                 "predictive_safety_residual_enabled": enable_predictive_safety_residual,
@@ -1131,6 +1237,8 @@ def main():
                     if (enable_safety_aux and enable_predictive_safety)
                     else (predictive_safety_base_reg_coeff if enable_safety_aux else 0.0)
                 ),
+                "safety_cpair_additive_weight_initial": safety_cpair_current_weight,
+                "safety_late_tiny_cpair_weight_initial": safety_late_tiny_cpair_current_weight,
                 "reward_normalization_enabled": enable_reward_norm,
                 "reward_normalization_layer": "RunningNorm" if enable_reward_norm else "disabled",
                 "debug_use_ground_truth_reward": debug_use_ground_truth_reward,
@@ -1340,21 +1448,8 @@ def main():
         ):
             next_legacy_weight = predictive_safety_late_reg_coeff
 
-        next_cpair_weight = 0.0
-        if (
-            enable_predictive_safety_residual
-            and predictive_safety_enable_cpair_additive
-            and epoch_to_train >= predictive_safety_cpair_additive_start_epoch
-        ):
-            next_cpair_weight = predictive_safety_cpair_additive_coeff
-
-        next_late_tiny_cpair_weight = 0.0
-        if (
-            enable_predictive_safety_residual
-            and predictive_safety_late_tiny_cpair_enable
-            and epoch_to_train >= predictive_safety_late_tiny_cpair_start_epoch
-        ):
-            next_late_tiny_cpair_weight = predictive_safety_late_tiny_cpair_coeff
+        next_cpair_weight = compute_cpair_additive_weight(epoch_to_train)
+        next_late_tiny_cpair_weight = compute_late_tiny_cpair_weight(epoch_to_train)
 
         if (
             abs(next_legacy_weight - safety_aux_current_weight) < 1e-8
@@ -1465,6 +1560,71 @@ def main():
     best_checkpoint_key = None
     best_checkpoint_epoch = None
     best_checkpoint_path = None
+    airl_snapshot_epochs = {292, 298, total_epochs}
+    saved_airl_snapshot_keys = set()
+
+    def build_airl_snapshot_path(epoch, suffix):
+        zip_path = build_safe_checkpoint_path(
+            checkpoint_dir,
+            run_label,
+            probe_tag=probe_tag,
+            prefix="airl_reward",
+            suffix=suffix,
+            epoch=epoch,
+        )
+        root, _ = os.path.splitext(zip_path)
+        return f"{root}.pt"
+
+    def save_airl_reward_snapshot(epoch, suffix="epoch"):
+        key = (suffix, int(epoch))
+        if key in saved_airl_snapshot_keys:
+            return None
+        snapshot_path = build_airl_snapshot_path(epoch, suffix)
+        effective_params = {
+            "epoch": int(epoch),
+            "probe_tag": probe_tag,
+            "safety_enabled": enable_safety,
+            "safety_branch_type": "none" if not enable_safety else ("real" if enable_safety_branch else "zero"),
+            "safety_aux_enabled": enable_safety_aux,
+            "trainer_class": type(airl_trainer).__name__,
+            "reward_net_class": type(reward_net).__name__,
+            "base_reward_net_class": type(base_reward_net).__name__,
+            "policy_features_extractor_class": policy_features_extractor_class,
+            "observation_dim": env_obs_dim,
+            "effective_attention_mode": attention_ablation_mode if enable_attention else "disabled",
+            "effective_goal_mode": goal_ablation_mode if enable_goal else "disabled",
+            "safety_net_class": type(safety_net).__name__ if safety_net is not None else "None",
+            "predictive_safety_net_class": (
+                type(predictive_safety_net).__name__ if predictive_safety_net is not None else "None"
+            ),
+            "predictive_safety_residual_enabled": enable_predictive_safety_residual,
+            "predictive_safety_residual_scale": (
+                predictive_safety_residual_scale if enable_predictive_safety_residual else 0.0
+            ),
+            "safety_aux_weight": safety_aux_current_weight,
+            "safety_cpair_additive_weight": safety_cpair_current_weight,
+            "safety_late_tiny_cpair_weight": safety_late_tiny_cpair_current_weight,
+            "gen_risk_penalty_lambda": gen_risk_penalty_current_lambda,
+        }
+        snapshot = {
+            "config": config_to_dict(cfg),
+            "effective_params": effective_params,
+            "reward_net": reward_net.state_dict() if reward_net is not None else None,
+            "base_reward_net": base_reward_net.state_dict() if base_reward_net is not None else None,
+            "safety_net": safety_net.state_dict() if safety_net is not None else None,
+            "predictive_safety_net": (
+                predictive_safety_net.state_dict() if predictive_safety_net is not None else None
+            ),
+            "airl_trainer_class": type(airl_trainer).__name__,
+            "airl_disc_step": getattr(airl_trainer, "_disc_step", None),
+            "airl_global_step": getattr(airl_trainer, "_global_step", None),
+        }
+        if hasattr(airl_trainer, "_disc_opt"):
+            snapshot["disc_optimizer"] = airl_trainer._disc_opt.state_dict()
+        torch.save(snapshot, snapshot_path)
+        saved_airl_snapshot_keys.add(key)
+        print(f"[*] AIRL reward/discriminator snapshot saved -> {snapshot_path}")
+        return snapshot_path
 
     for chunk in range(chunks):
         # ==========================================
@@ -1550,6 +1710,8 @@ def main():
             epoch=current_epoch,
         )
         learner.save(checkpoint_path)
+        if current_epoch in airl_snapshot_epochs:
+            save_airl_reward_snapshot(current_epoch, suffix="epoch")
         eval_metrics = last_eval_metrics
         if current_epoch >= best_select_start_epoch:
             current_best_key = build_best_key(eval_metrics)
@@ -1565,6 +1727,7 @@ def main():
                     epoch=current_epoch,
                 )
                 learner.save(best_checkpoint_path)
+                save_airl_reward_snapshot(current_epoch, suffix="best_epoch")
                 print(f"[*] Best checkpoint updated -> {best_checkpoint_path}")
 
         print(
@@ -1599,6 +1762,7 @@ def main():
         suffix="final",
     )
     learner.save(final_checkpoint_path)
+    save_airl_reward_snapshot(total_epochs, suffix="final")
     print(f"\n训练全部完成，最终策略已保存为 {final_checkpoint_path}。")
 
     if best_checkpoint_path is not None:

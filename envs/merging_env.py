@@ -7,10 +7,10 @@ class MergingEnv(gym.Env):
     """
     基于 Gymnasium 重构的匝道合流环境
     """
-    def __init__(self, dataset):
+    def __init__(self, dataset, cfg=None):
         super(MergingEnv, self).__init__()
         self.dataset = dataset
-        self.cfg = Config()
+        self.cfg = cfg if cfg is not None else Config()
 
         # [新增] 从数据加载器中提取专家统计量，用于实时归一化
         self.expert_mean = self.dataset.expert_mean
@@ -21,7 +21,11 @@ class MergingEnv(gym.Env):
         
         # [修改点 1]: 动态决定状态维度 (18维 or 16维)
         self.enable_goal = getattr(self.cfg, 'ENABLE_GOAL_CONDITION', False)
-        obs_dim = 18 if self.enable_goal else 16
+        self.goal_ablation_mode = str(getattr(self.cfg, "GOAL_ABLATION_MODE", "normal")).lower()
+        if self.goal_ablation_mode not in {"normal", "zero", "drop"}:
+            raise ValueError(f"Unknown GOAL_ABLATION_MODE: {self.goal_ablation_mode}")
+        self.append_goal = self.enable_goal and self.goal_ablation_mode != "drop"
+        obs_dim = 18 if self.append_goal else 16
         
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
@@ -375,12 +379,16 @@ class MergingEnv(gym.Env):
         # ==========================================
         
         enable_goal = getattr(self.cfg, 'ENABLE_GOAL_CONDITION', False)
+        goal_mode = str(getattr(self.cfg, "GOAL_ABLATION_MODE", "normal")).lower()
+        append_goal = enable_goal and goal_mode != "drop"
 
-        if enable_goal:
+        if append_goal:
             # 2. 提取目标信息
             t_idx = min(self.t, len(self.current_traj['goal']) - 1)
             # 注意：current_traj['goal'] 在 data_loader 中已经被归一化过了！
-            current_goal = self.current_traj['goal'][t_idx] 
+            current_goal = self.current_traj['goal'][t_idx]
+            if goal_mode == "zero":
+                current_goal = np.zeros_like(current_goal)
             
             # 3. 拼接已经归一化的 state 和已经归一化的 goal
             obs_18 = np.concatenate([normalized_state, current_goal], axis=-1)

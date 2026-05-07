@@ -127,6 +127,7 @@ class ZeroSafetyQNetwork(nn.Module):
         self.action_dim = int(action_dim)
         self.feature_dim = int(feature_dim)
         self.use_action = bool(use_action)
+        self.is_zero_safety_prior = True
 
     def forward(
         self,
@@ -214,6 +215,8 @@ class _SafetyFusionMixin:
         else:
             q_logit, q_feat = self.safety_net(core_state, safety_action, return_feature=True)
         q_risk = torch.sigmoid(q_logit)
+        if getattr(self.safety_net, "is_zero_safety_prior", False):
+            q_risk = torch.zeros_like(q_risk)
 
         if self.predictive_safety_net is not None and self.predictive_residual_scale > 0.0:
             predictive_action = action if self.predictive_safety_net.use_action else None
@@ -279,6 +282,8 @@ class _SafetyFusionMixin:
         else:
             base_q_logit, _ = self.safety_net(core_state, safety_action, return_feature=True)
         base_q_risk = torch.sigmoid(base_q_logit)
+        if getattr(self.safety_net, "is_zero_safety_prior", False):
+            base_q_risk = torch.zeros_like(base_q_risk)
 
         pred_q_logit = None
         pred_q_risk = None
@@ -323,6 +328,7 @@ class SafeQAttentionRewardNet(_SafetyFusionMixin, RewardNet):
         safety_net: SafetyQNetwork,
         *,
         hidden_dim: int = 64,
+        attention_ablation_mode: str = "normal",
         safety_embed_dim: int = 32,
         freeze_safety: bool = True,
         fuse_safety_feature: bool = True,
@@ -337,7 +343,7 @@ class SafeQAttentionRewardNet(_SafetyFusionMixin, RewardNet):
         self.obs_dim = int(obs_dim)
         self.act_dim = int(act_dim)
 
-        self.attention = SocialAttentionLayer(obs_dim, hidden_dim)
+        self.attention = SocialAttentionLayer(obs_dim, hidden_dim, ablation_mode=attention_ablation_mode)
         self.behavior_proj = nn.Sequential(
             nn.Linear(obs_dim + hidden_dim + act_dim, 128),
             nn.Tanh(),

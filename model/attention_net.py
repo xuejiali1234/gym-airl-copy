@@ -11,10 +11,14 @@ class SocialAttentionLayer(nn.Module):
     """
     轻量级社会注意力机制 (带缺失车辆 Mask 处理)
     """
-    def __init__(self, obs_dim, hidden_dim=64, num_heads=4):
+    def __init__(self, obs_dim, hidden_dim=64, num_heads=4, ablation_mode="normal"):
         super(SocialAttentionLayer, self).__init__()
         ego_dim = 4
         nbr_dim = 4
+        self.hidden_dim = int(hidden_dim)
+        self.ablation_mode = str(ablation_mode).lower()
+        if self.ablation_mode not in {"normal", "zero"}:
+            raise ValueError(f"Unknown attention ablation mode: {self.ablation_mode}")
         
         self.query_proj = nn.Linear(ego_dim, hidden_dim)
         self.key_proj = nn.Linear(nbr_dim, hidden_dim)
@@ -23,6 +27,9 @@ class SocialAttentionLayer(nn.Module):
         self.attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, batch_first=True)
         
     def forward(self, state):
+        if self.ablation_mode == "zero":
+            return state.new_zeros(state.shape[0], self.hidden_dim)
+
         ego = state[:, 0:4]
             
         # 提取周车特征 [Batch, 3, 4]
@@ -60,12 +67,12 @@ class SocialAttentionLayer(nn.Module):
 # 2. PPO 特征提取器
 # ==========================================
 class AttentionFeaturesExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space, hidden_dim=64):
+    def __init__(self, observation_space, hidden_dim=64, attention_ablation_mode="normal"):
         obs_dim = observation_space.shape[0]
         features_dim = obs_dim + hidden_dim
         super(AttentionFeaturesExtractor, self).__init__(observation_space, features_dim)
         
-        self.attention = SocialAttentionLayer(obs_dim, hidden_dim)
+        self.attention = SocialAttentionLayer(obs_dim, hidden_dim, ablation_mode=attention_ablation_mode)
 
     def forward(self, observations):
         feat = self.attention(observations)
@@ -113,12 +120,12 @@ class GoalConditionedMLPFeaturesExtractor(BaseFeaturesExtractor):
 # 3. AIRL 奖励网络 (修复张量通道)
 # ==========================================
 class AttentionRewardNet(RewardNet):
-    def __init__(self, observation_space, action_space, hidden_dim=64):
+    def __init__(self, observation_space, action_space, hidden_dim=64, attention_ablation_mode="normal"):
         super(AttentionRewardNet, self).__init__(observation_space, action_space)
         obs_dim = observation_space.shape[0]
         act_dim = action_space.shape[0]
         
-        self.attention = SocialAttentionLayer(obs_dim, hidden_dim)
+        self.attention = SocialAttentionLayer(obs_dim, hidden_dim, ablation_mode=attention_ablation_mode)
         
         # 【严格对齐基线】：将下游 MLP 的深度和宽度对齐为 (128, 128)
         self.mlp = nn.Sequential(
