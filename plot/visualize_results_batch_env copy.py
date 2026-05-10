@@ -22,21 +22,29 @@ from configs.config import Config
 from utils.data_loader import MergingDataset
 from envs.merging_env import MergingEnv
 
-MODEL_TAG = "G1A0S0_Goal_epoch287"
+MODEL_TAG = "P30_CPairD250_NoLateLR_epoch298"
 MODEL_PATH = os.path.join(
     root_dir,
     "train_log",
-    "baseline_mlp_goal_nosafe_probe_G1A0S0_Goal_20260507_220051",
+    "baseline_attn_goal_safe_branch_aux_probe_P30_CPairD250_NoLateLR_Save1_20260502_215110",
     "checkpoints",
-    "baseline_policy_G1A0S0_Goal_best_epoch_287.zip",
+    "baseline_policy_attn_goal_safe_branch_aux_probe_P30_CPairD250_NoLateLR_Save1_epoch_298.zip",
 )
 
-# 设置中文字体
-try:
-    matplotlib.rcParams['font.sans-serif'] = ['SimHei']
-    matplotlib.rcParams['axes.unicode_minus'] = False
-except:
-    print("警告: 未找到 SimHei 字体，将使用默认字体")
+FT_TO_M = 0.3048
+
+# Paper-style figure defaults.
+matplotlib.rcParams.update({
+    "font.family": "Times New Roman",
+    "font.size": 10,
+    "axes.unicode_minus": False,
+    "axes.linewidth": 1.0,
+    "xtick.direction": "in",
+    "ytick.direction": "in",
+    "xtick.major.size": 3.5,
+    "ytick.major.size": 3.5,
+    "legend.frameon": False,
+})
 
 
 class SingleTrajDataset:
@@ -96,7 +104,7 @@ def run_inference(model, env):
 
 def visualize_trajectory_batch():
     print("=" * 80)
-    print("开始批量轨迹可视化 (Random 20 Samples)")
+    print("开始批量轨迹可视化 (All Trajectories)")
     print("=" * 80)
 
     cfg = Config()
@@ -144,11 +152,40 @@ def visualize_trajectory_batch():
     # ---------------------------------------------------------
     # 3. 随机抽取轨迹进行推演
     # ---------------------------------------------------------
-    num_samples = min(int(os.environ.get("VIS_NUM_SAMPLES", "20")), len(global_dataset))
-    # 随机抽取轨迹索引
-    selected_indices = random.sample(range(len(global_dataset)), num_samples)
+    target_filename = os.environ.get("VIS_TARGET_FILENAME", "").strip()
+    if target_filename:
+        target_basename = os.path.basename(target_filename)
+        selected_indices = [
+            idx for idx in range(len(global_dataset))
+            if os.path.basename(str(global_dataset[idx].get("filename", ""))) == target_basename
+        ]
+        if not selected_indices:
+            selected_indices = [
+                idx for idx in range(len(global_dataset))
+                if target_basename in os.path.basename(str(global_dataset[idx].get("filename", "")))
+            ]
+        if not selected_indices:
+            print(f"[ERROR] 全局数据集中找不到指定轨迹: {target_filename}")
+            return
+        selected_indices = selected_indices[:1]
+        num_samples = 1
+    else:
+        sample_spec = os.environ.get("VIS_NUM_SAMPLES", "all").strip().lower()
+        if sample_spec in {"", "all", "*", "0"}:
+            selected_indices = list(range(len(global_dataset)))
+            num_samples = len(selected_indices)
+        else:
+            num_samples = min(int(sample_spec), len(global_dataset))
+            rng = random.Random(int(os.environ.get("VIS_RANDOM_SEED", "42")))
+            # 随机抽取轨迹索引
+            selected_indices = rng.sample(range(len(global_dataset)), num_samples)
     
-    output_dir = os.path.join(root_dir, "plot", "batch_results", MODEL_TAG)
+    print(f"[INFO] 本次绘制轨迹数: {num_samples}")
+    
+    output_tag = MODEL_TAG
+    if not target_filename and len(selected_indices) == len(global_dataset):
+        output_tag = f"{MODEL_TAG}_all"
+    output_dir = os.path.join(root_dir, "plot", "batch_results", output_tag)
     os.makedirs(output_dir, exist_ok=True)
     print(f"[OUTPUT] 结果将保存至: {output_dir}")
 
@@ -174,49 +211,107 @@ def visualize_trajectory_batch():
             # --- C. 运行模型推理 ---
             model_x, model_y, model_v = run_inference(model, env)
 
-            # --- D. 绘图 (逻辑不变) ---
-            fig, ax = plt.subplots(figsize=(7, 8.5)) 
+            # --- D. 绘图：仅在绘图阶段换算为 SI 单位 ---
+            gt_x_m = gt_x * FT_TO_M
+            gt_y_m = gt_y * FT_TO_M
+            gt_v_mps = gt_v * FT_TO_M
+            model_x_m = np.asarray(model_x) * FT_TO_M
+            model_y_m = np.asarray(model_y) * FT_TO_M
+            model_v_mps = np.asarray(model_v) * FT_TO_M
 
-            vmin_val, vmax_val = 0.0, 80.0
-            y_min, y_max = min(np.min(gt_y), np.min(model_y)) - 20, max(np.max(gt_y), np.max(model_y)) + 20
+            fig, ax = plt.subplots(figsize=(5.1, 5.0))
 
-            # 绘制道路边界
-            boundary_style = {'color': 'gray', 'linestyle': '--', 'linewidth': 1.0, 'alpha': 0.7}
-            ax.vlines([cfg.X_MIN, cfg.X_MAX], y_min, y_max, **boundary_style)
-            ax.vlines([cfg.X_MIN + cfg.LANE_WIDTH], y_min, y_max, color='black', linestyle='--', linewidth=1.5, alpha=0.8)
+            vmin_val, vmax_val = 0.0, 25.0
+            y_min = min(np.min(gt_y_m), np.min(model_y_m)) - 6.0
+            y_max = max(np.max(gt_y_m), np.max(model_y_m)) + 6.0
+            road_x_min = cfg.X_MIN * FT_TO_M
+            road_x_max = cfg.X_MAX * FT_TO_M
+            lane_divider_x = (cfg.X_MIN + cfg.LANE_WIDTH) * FT_TO_M
+
+            # Use the plot frame as the road edge; only draw the internal lane divider.
+            ax.vlines(
+                lane_divider_x,
+                y_min,
+                y_max,
+                color="0.15",
+                linestyle="--",
+                linewidth=1.0,
+                alpha=0.85,
+                zorder=1,
+            )
 
             # 绘制 Ground Truth 颜色渐变线
-            points = np.array([gt_x, gt_y]).T.reshape(-1, 1, 2)
+            points = np.array([gt_x_m, gt_y_m]).T.reshape(-1, 1, 2)
             segments = np.concatenate([points[:-1], points[1:]], axis=1)
-            lc = LineCollection(segments, cmap='RdYlGn_r', linewidth=4.0, alpha=0.7, zorder=2)
-            lc.set_array(gt_v)
+            lc = LineCollection(segments, cmap='RdYlGn_r', linewidth=2.2, alpha=0.75, zorder=2)
+            lc.set_array(gt_v_mps)
             lc.set_clim(vmin=vmin_val, vmax=vmax_val)
             ax.add_collection(lc)
-            ax.plot(gt_x, gt_y, color='black', linewidth=1.0, alpha=0.4, label='Ground Truth', zorder=2)
+            truth_line, = ax.plot(
+                gt_x_m,
+                gt_y_m,
+                color="black",
+                linewidth=1.2,
+                alpha=0.65,
+                label="Truth",
+                zorder=3,
+            )
             
             # 绘制 Model 轨迹散点
-            sc = ax.scatter(model_x, model_y, c=model_v, cmap='RdYlGn_r', s=25, edgecolors='black', linewidths=0.5, label=MODEL_TAG, zorder=3, vmin=vmin_val, vmax=vmax_val)
-            cbar = plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-            cbar.set_label('Velocity (ft/s)', rotation=270, labelpad=15)
-
-            # 绘制起点和终点标记
-            ax.scatter(gt_x[0], gt_y[0], c='green', s=120, label='Start', zorder=5, edgecolors='white')
-            ax.scatter(gt_x[-1], gt_y[-1], c='red', marker='X', s=120, label='End (GT)', zorder=5, edgecolors='white')
-            ax.scatter(model_x[-1], model_y[-1], c='purple', marker='*', s=200, label='End (Model)', zorder=6, edgecolors='white')
-
+            pred_points = ax.scatter(
+                model_x_m,
+                model_y_m,
+                c=model_v_mps,
+                cmap='RdYlGn_r',
+                s=13,
+                edgecolors='black',
+                linewidths=0.35,
+                label='Prediction',
+                zorder=4,
+                vmin=vmin_val,
+                vmax=vmax_val,
+            )
             # 图片修饰
-            ax.set_title(f'Trajectory Comparison\n{filename}', fontsize=12, fontweight='bold', pad=25)
-            ax.set_aspect(0.5)
-            ax.set_xlim(cfg.X_MIN - 5, cfg.X_MAX + 5)
+            ax.set_aspect(1.0 / 3.0)
+            ax.set_anchor('W')
+            ax.set_xlim(road_x_min, road_x_max)
             ax.set_ylim(y_min, y_max)
-            ax.set_xlabel('Lateral Position (ft)')
-            ax.set_ylabel('Longitudinal Position (ft)')
-            ax.legend(loc='upper right', bbox_to_anchor=(-0.1, 1.0), fontsize=8)
-            ax.grid(True, linestyle=':', alpha=0.3)
+            ax.set_xlabel('')
+            ax.set_ylabel('')
+            ax.tick_params(labelsize=9, top=False, right=False)
 
-            save_path = os.path.join(output_dir, filename.replace('.csv', '.png'))
-            plt.tight_layout()
-            plt.savefig(save_path, dpi=300)
+            cbar = plt.colorbar(pred_points, ax=ax, fraction=0.045, pad=0.12)
+            cbar.ax.set_title('Speed (m/s)', pad=8, fontsize=10)
+            cbar.ax.tick_params(labelsize=9, pad=4)
+
+            ax.grid(False)
+
+            right_xtick = max(t for t in ax.get_xticks() if road_x_min <= t <= road_x_max)
+            ax.annotate(
+                '(m)',
+                xy=(right_xtick, 0.0),
+                xycoords=ax.get_xaxis_transform(),
+                xytext=(-1, -2),
+                textcoords='offset points',
+                ha='left',
+                va='top',
+                fontsize=10,
+                annotation_clip=False,
+            )
+            ax.text(
+                -0.18,
+                0.965,
+                '(m)',
+                transform=ax.transAxes,
+                ha='center',
+                va='top',
+                fontsize=10,
+            )
+
+            save_stem = os.path.splitext(filename)[0]
+            save_path = os.path.join(output_dir, f"{i + 1:03d}_{save_stem}.png")
+            fig.tight_layout()
+            plt.savefig(save_path, dpi=300, bbox_inches='tight', pad_inches=0.03)
             plt.close(fig)
             print(f"   -> 已保存: {save_path}")
 

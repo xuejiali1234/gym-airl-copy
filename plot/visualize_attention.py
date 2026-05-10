@@ -105,6 +105,109 @@ def run_inference_and_log(model, cfg, data_path, expert_mean, expert_std):
     hook_handle.remove() 
     return np.array(traj_points), pd.DataFrame(logs)
 
+
+class SingleTrajDataset:
+    """Wrap one trajectory that was already normalized by the global dataset."""
+
+    def __init__(self, traj, expert_mean, expert_std):
+        self.trajectories = [traj]
+        self.expert_mean = expert_mean
+        self.expert_std = expert_std
+
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, idx):
+        return self.trajectories[idx]
+
+
+def find_global_trajectory(dataset, target_filename):
+    target_basename = os.path.basename(target_filename)
+    for idx in range(len(dataset)):
+        traj = dataset[idx]
+        filename = os.path.basename(str(traj.get("filename", "")))
+        if filename == target_basename:
+            return traj
+
+    for idx in range(len(dataset)):
+        traj = dataset[idx]
+        filename = os.path.basename(str(traj.get("filename", "")))
+        if target_basename in filename:
+            return traj
+
+    return dataset[0]
+
+
+def run_inference_and_log(model, cfg, traj, expert_mean, expert_std):
+    """
+    Run inference with the same trajectory/normalization path used by
+    visualize_results_batch_env copy.py, then capture attention weights.
+    """
+    filename = traj.get("filename", "unknown")
+    print(f"... 使用全局归一化后的轨迹进行推理: {filename}")
+
+    single_dataset = SingleTrajDataset(traj, expert_mean, expert_std)
+    env = MergingEnv(single_dataset, cfg=cfg)
+    obs, _ = env.reset(seed=42)
+
+    captured_attn_weights = []
+    hook_handle = None
+
+    def attn_hook(module, inp, out):
+        captured_attn_weights.append(out[1].detach().cpu().numpy())
+
+    try:
+        hook_handle = model.policy.features_extractor.attention.attn.register_forward_hook(attn_hook)
+    except Exception as exc:
+        print(f"[WARN] 未能挂载 attention hook，将只绘制轨迹: {exc}")
+
+    traj_points = []
+    logs = []
+
+    px, py, vx, vy = env.ego_state
+    traj_points.append([px, py, np.sqrt(vx ** 2 + vy ** 2)])
+
+    done = False
+    step_count = 0
+    max_steps = len(traj["ego_pos"]) + 50
+
+    while not done and step_count < max_steps:
+        captured_attn_weights.clear()
+
+        action, _ = model.predict(obs, deterministic=True)
+
+        if captured_attn_weights:
+            w_np = captured_attn_weights[0]
+            weights = w_np[0, 0] if w_np.ndim == 3 else w_np[0]
+            weights = np.asarray(weights, dtype=np.float32).reshape(-1)
+            if weights.size < 3:
+                weights = np.pad(weights, (0, 3 - weights.size), constant_values=0.0)
+        else:
+            weights = np.zeros(3, dtype=np.float32)
+
+        px, py, vx, vy = env.ego_state
+        logs.append({
+            "Step": step_count,
+            "Ego_X": px,
+            "Ego_Y": py,
+            "L6_Lead_Attn": weights[0],
+            "L5_Lead_Attn": weights[1],
+            "L5_Foll_Attn": weights[2],
+        })
+
+        obs, reward, terminated, truncated, info = env.step(action)
+        done = terminated or truncated
+
+        px, py, vx, vy = env.ego_state
+        traj_points.append([px, py, np.sqrt(vx ** 2 + vy ** 2)])
+        step_count += 1
+
+    if hook_handle is not None:
+        hook_handle.remove()
+
+    return np.array(traj_points), pd.DataFrame(logs)
+
+
 def visualize_attention_analysis():
     print("=" * 80)
     print("开始注意力权重可视化分析 (对齐 Batch Env 逻辑)")
@@ -131,7 +234,13 @@ def visualize_attention_analysis():
     # ---------------------------------------------------------
     try:
         # 修改为最新的 Attention 模型名称
-        model_path = os.path.join(root_dir, "checkpoints", "baseline_policy_attn_epoch_200.zip")
+        model_path = os.path.join(
+            root_dir,
+            "train_log",
+            "baseline_attn_goal_safe_branch_aux_probe_P30_CPairD250_NoLateLR_Save1_20260502_215110",
+            "checkpoints",
+            "baseline_policy_attn_goal_safe_branch_aux_probe_P30_CPairD250_NoLateLR_Save1_epoch_298.zip",
+        )
         
         if not os.path.exists(model_path):
             zips = glob.glob(os.path.join(root_dir, "checkpoints", "*_attn_*.zip"))
@@ -147,7 +256,7 @@ def visualize_attention_analysis():
     # ---------------------------------------------------------
     # 3. 选择测试文件
     # ---------------------------------------------------------
-    target_filename = "vehicle_1280_trajectory.csv"
+    target_filename = os.environ.get("VIS_TARGET_FILENAME", "vehicle_1279_trajectory.csv")
     data_root = os.path.join(root_dir, "data")
     files = glob.glob(os.path.join(data_root, "**", target_filename), recursive=True)
     
@@ -160,13 +269,17 @@ def visualize_attention_analysis():
 
     # 读取 GT 仅用于画图参考
     df_gt = pd.read_csv(data_path)
-    gt_x, gt_y = df_gt['KF_Local_X'].values, df_gt['KF_Local_Y'].values
+    # Ground truth below comes from the globally parsed trajectory.
+    traj = find_global_trajectory(train_dataset, target_filename)
+    print(f"[OK] 使用与 batch 绘图一致的全局轨迹: {traj.get('filename', 'unknown')}")
+    gt_x = traj["ego_pos"][:, 0]
+    gt_y = traj["ego_pos"][:, 1]
     
     # ---------------------------------------------------------
     # 4. 运行推理 (传入 data_path 和全局统计量)
     # ---------------------------------------------------------
     print("🧠 运行严格对齐的推理环境...")
-    traj_points, log_df = run_inference_and_log(model, cfg, data_path, global_expert_mean, global_expert_std)
+    traj_points, log_df = run_inference_and_log(model, cfg, traj, global_expert_mean, global_expert_std)
 
     # ---------------------------------------------------------
     # 5. 绘图部分
