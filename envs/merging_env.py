@@ -38,6 +38,7 @@ class MergingEnv(gym.Env):
         self.collision_margin = 1.0
         self.has_collided_this_episode = False
         self.start_dist_to_goal = 1.0
+        self.prev_ax_phys = 0.0
         self.prev_ay_phys = 0.0
         self.eval_dense_return = 0.0
 
@@ -58,6 +59,7 @@ class MergingEnv(gym.Env):
         self.start_y = init_pos[1]
         goal_xy = self.current_traj['ego_pos'][-1]
         self.start_dist_to_goal = float(np.linalg.norm(self.ego_state[:2] - goal_xy))
+        self.prev_ax_phys = 0.0
         self.prev_ay_phys = 0.0
         self.eval_dense_return = 0.0
 
@@ -146,6 +148,7 @@ class MergingEnv(gym.Env):
     def _compute_eval_dense_reward(
         self,
         prev_state,
+        ax_phys,
         ay_phys,
         curr_state,
         surr_now,
@@ -162,7 +165,10 @@ class MergingEnv(gym.Env):
 
         d_prev = np.linalg.norm(prev_state[:2] - goal_xy)
         d_curr = np.linalg.norm(curr_state[:2] - goal_xy)
-        p_goal = max(0.0, d_prev - d_curr) / max(self.start_dist_to_goal, 1.0)
+        goal_progress_scale = float(getattr(self.cfg, 'PPO_RL_GOAL_PROGRESS_SCALE', 20.0))
+        # PPO-RL uses a fixed, signed goal-progress scale so moving away from the
+        # merge destination is penalized instead of simply receiving zero reward.
+        p_goal = float(np.clip((d_prev - d_curr) / max(goal_progress_scale, 1e-6), -1.0, 1.0))
 
         lane_gap_prev = max(0.0, px_prev - lane_target_x)
         lane_gap_curr = max(0.0, px - lane_target_x)
@@ -170,13 +176,16 @@ class MergingEnv(gym.Env):
 
         vy_mps = vy * ft_to_m
         ay_mps2 = abs(ay_phys) * ft_to_m
+        jerk_x_mps3 = abs(ax_phys - self.prev_ax_phys) / self.cfg.DT * ft_to_m
         jerk_mps3 = abs(ay_phys - self.prev_ay_phys) / self.cfg.DT * ft_to_m
+        jerk_2d_mps3 = float(np.sqrt(jerk_x_mps3 ** 2 + jerk_mps3 ** 2))
         min_ttc, min_thw = self._compute_min_ttc_thw(px, py, vy, surr_now)
 
         # Eval-only dense shaping: center always-positive survival terms at zero.
         e_t = np.clip(vy_mps / 15.0, 0.0, 1.0) - 0.5
         s_ttc = np.clip(min_ttc / 4.0, 0.0, 1.0) - 0.5
-        s_thw = np.clip(min_thw / 2.0, 0.0, 1.0) - 0.5
+        thw_safe_seconds = float(getattr(self.cfg, 'PPO_RL_THW_SAFE_SECONDS', 2.0))
+        s_thw = np.clip(min_thw / max(thw_safe_seconds, 1e-6), 0.0, 1.0) - 0.5
         c_jerk = np.clip(jerk_mps3 / 3.0, 0.0, 1.0)
         c_acc = np.clip(ay_mps2 / 3.0, 0.0, 1.0)
 
@@ -199,6 +208,9 @@ class MergingEnv(gym.Env):
             'eval_goal_progress': float(p_goal),
             'eval_lane_progress': float(p_lane),
             'eval_vy_mps': float(vy_mps),
+            'eval_abs_jerk_x_mps3': float(jerk_x_mps3),
+            'eval_abs_jerk_y_mps3': float(jerk_mps3),
+            'eval_abs_jerk_2d_mps3': float(jerk_2d_mps3),
             'eval_abs_jerk_mps3': float(jerk_mps3),
         }
 
@@ -305,6 +317,7 @@ class MergingEnv(gym.Env):
 
         eval_dense_reward, dense_info = self._compute_eval_dense_reward(
             prev_state=prev_state,
+            ax_phys=ax,
             ay_phys=ay,
             curr_state=self.ego_state,
             surr_now=surr_now,
@@ -314,6 +327,7 @@ class MergingEnv(gym.Env):
             is_collided_new=is_collided_new,
         )
         self.eval_dense_return += eval_dense_reward
+        self.prev_ax_phys = ax
         self.prev_ay_phys = ay
 
         info = {

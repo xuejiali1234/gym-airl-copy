@@ -38,6 +38,11 @@ try:
 except:
     pass
 
+TITLE_FONTSIZE = 28
+LABEL_FONTSIZE = 24
+TICK_FONTSIZE = 20
+LEGEND_FONTSIZE = 20
+
 class SingleTrajDataset:
     """
     单轨迹虚拟数据集包装器，用于确保环境正确加载单条轨迹并使用全局归一化统计量
@@ -62,7 +67,7 @@ class Figure5Generator:
 
         # 1. 优先加载 Dataset 获取全局归一化统计量
         try:
-            print("... 正在加载数据集以获取全局完美归一化轨迹 ...")
+            print("[*] 正在加载数据集以获取全局归一化统计量 ...")
             stats_data_paths = [
                 os.path.join(root_dir, 'data', 'lane_change_trajectories-0750am-0805am'),
                 os.path.join(root_dir, 'data', 'lane_change_trajectories-0805am-0820am'),
@@ -73,20 +78,20 @@ class Figure5Generator:
                 raise ValueError("用于计算统计量的数据集为空!")
             
             self.expert_mean, self.expert_std = self.global_dataset.get_stats()
-            print("✅ 全局归一化统计量加载完毕")
+            print("[OK] 全局归一化统计量加载完毕")
         except Exception as e:
-            print(f"❌ 初始化归一化器失败: {e}")
+            print(f"[ERR] 初始化归一化器失败: {e}")
             sys.exit(1)
 
         # 2. 加载 SB3 PPO 模型
-        model_path = os.path.join(root_dir, "checkpoints", "baseline_policy_attn_goal_safe_branch_aux_probe_P300_U220_L5e6_D230_epoch_290.zip")
+        model_path = os.path.join(root_dir, "checkpoints", "baseline_policy_attn_goal_safe_branch_aux_probe_P30_CPairD250_NoLateLR_Save1_epoch_298.zip")
         if not os.path.exists(model_path):
-            print(f"⚠️ 未找到模型: {model_path}，请检查路径。")
+            print(f"[WARN] 未找到模型: {model_path}，请检查路径。")
             sys.exit(1)
             
         print(f"--- 正在加载 SB3 策略模型 ---")
         self.model = PPO.load(model_path, device=self.device)
-        print(f"✅ 模型加载成功: {model_path}")
+        print(f"[OK] 模型加载成功: {model_path}")
         
         # 参数
         self.target_lane_divider = self.cfg.X_MIN + getattr(self.cfg, 'LANE_WIDTH', 12.0)
@@ -183,13 +188,13 @@ class Figure5Generator:
         return speed, acc, ttc_list, thw_list
 
     def collect_data(self, n_samples=100):
-        print(f"🔄 正在收集数据 (样本数: {n_samples})...")
+        print(f"[*] 正在收集数据 (样本数: {n_samples})...")
         all_traj_infos = [] 
 
         n_samples = min(n_samples, len(self.global_dataset))
         selected_indices = random.sample(range(len(self.global_dataset)), n_samples)
 
-        print("1️⃣ 处理真实轨迹并计算评分...")
+        print("[1/2] 处理真实轨迹并计算评分...")
         for idx in tqdm(selected_indices):
             try:
                 traj = self.global_dataset[idx]
@@ -225,7 +230,7 @@ class Figure5Generator:
         n_top20 = max(1, int(len(all_traj_infos) * 0.2))
         top20_infos = all_traj_infos[:n_top20]
         
-        print(f"✅ 已筛选 Top 20% 轨迹: {len(top20_infos)} / {len(all_traj_infos)}")
+        print(f"[OK] 已筛选 Top 20% 轨迹: {len(top20_infos)} / {len(all_traj_infos)}")
 
         real_data_all = {'speed': [], 'acc': [], 'ttc': [], 'thw': []}
         real_data_top20 = {'speed': [], 'acc': [], 'ttc': [], 'thw': []}
@@ -244,7 +249,7 @@ class Figure5Generator:
             real_data_top20['ttc'].extend(m['ttc'])
             real_data_top20['thw'].extend(m['thw'])
 
-        print("2️⃣ 运行模型仿真...")
+        print("[2/2] 运行模型仿真...")
         model_data = {'speed': [], 'acc': [], 'ttc': [], 'thw': []}
         
         for info in tqdm(all_traj_infos):
@@ -294,8 +299,8 @@ class Figure5Generator:
         return real_data_all, real_data_top20, model_data
 
     def plot(self, real_data_all, real_data_top20, model_data):
-        print("📊 正在绘图...")
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        print("[*] 正在绘图...")
+        fig, axes = plt.subplots(2, 2, figsize=(24, 18))
 
         color_real = 'gray'
         color_top20 = 'green'
@@ -306,50 +311,92 @@ class Figure5Generator:
         # (a) Speed
         ax = axes[0, 0]
         sns.histplot(real_data_all['speed'], color=color_real, label='Real Data (All)', kde=True, ax=ax, stat="density", bins=bins, alpha=alpha)
-        sns.histplot(real_data_top20['speed'], color=color_top20, label='Real Data (Top 20%)', kde=True, ax=ax, stat="density", bins=bins, alpha=0.3)
+        # sns.histplot(
+        #     real_data_top20['speed'],
+        #     color=color_top20,
+        #     label='Real Data (Top 20%)',
+        #     kde=True,
+        #     ax=ax,
+        #     stat="density",
+        #     bins=bins,
+        #     alpha=0.3,
+        # )
         sns.histplot(model_data['speed'], color=color_model, label='GC-AIRL', kde=True, ax=ax, stat="density", bins=bins, alpha=alpha)
-        ax.set_title('(a) Speed Distribution (m/s)')
-        ax.set_xlabel('Speed (m/s)')
-        ax.legend()
+        ax.set_title('(a) Speed Distribution (m/s)', fontsize=TITLE_FONTSIZE, pad=14)
+        ax.set_xlabel('Speed (m/s)', fontsize=LABEL_FONTSIZE)
+        ax.set_ylabel('Density', fontsize=LABEL_FONTSIZE)
+        ax.tick_params(axis='both', labelsize=TICK_FONTSIZE)
+        ax.legend(fontsize=LEGEND_FONTSIZE, loc='upper right', frameon=True)
 
         # (b) Acceleration
         ax = axes[0, 1]
         sns.histplot(real_data_all['acc'], color=color_real, label='Real Data (All)', kde=True, ax=ax, stat="density", bins=bins, alpha=alpha)
-        sns.histplot(real_data_top20['acc'], color=color_top20, label='Real Data (Top 20%)', kde=True, ax=ax, stat="density", bins=bins, alpha=0.3)
+        # sns.histplot(
+        #     real_data_top20['acc'],
+        #     color=color_top20,
+        #     label='Real Data (Top 20%)',
+        #     kde=True,
+        #     ax=ax,
+        #     stat="density",
+        #     bins=bins,
+        #     alpha=0.3,
+        # )
         sns.histplot(model_data['acc'], color=color_model, label='GC-AIRL', kde=True, ax=ax, stat="density", bins=bins, alpha=alpha)
         ax.set_title('(b) Acceleration Distribution (m/s²)')
         ax.set_xlabel('Acceleration (m/s²)')
         ax.set_xlim(-4, 4)
-        ax.legend()
+        ax.set_title('(b) Acceleration Distribution (m/s^2)', fontsize=TITLE_FONTSIZE, pad=14)
+        ax.set_xlabel('Acceleration (m/s^2)', fontsize=LABEL_FONTSIZE)
+        ax.set_ylabel('Density', fontsize=LABEL_FONTSIZE)
+        ax.tick_params(axis='both', labelsize=TICK_FONTSIZE)
+        ax.legend(fontsize=LEGEND_FONTSIZE, loc='upper right', frameon=True)
 
         # (c) TTC
         ax = axes[1, 0]
         sns.kdeplot(real_data_all['ttc'], color=color_real, label='Real Data (All)', fill=True, ax=ax, alpha=0.2)
-        sns.kdeplot(real_data_top20['ttc'], color=color_top20, label='Real Data (Top 20%)', fill=True, ax=ax, alpha=0.2)
+        # sns.kdeplot(
+        #     real_data_top20['ttc'],
+        #     color=color_top20,
+        #     label='Real Data (Top 20%)',
+        #     fill=True,
+        #     ax=ax,
+        #     alpha=0.2,
+        # )
         sns.kdeplot(model_data['ttc'], color=color_model, label='GC-AIRL', fill=True, ax=ax, alpha=0.2)
-        ax.set_title('(c) TTC Distribution (s)')
-        ax.set_xlabel('Time to Collision (s)')
+        ax.set_title('(c) TTC Distribution (s)', fontsize=TITLE_FONTSIZE, pad=14)
+        ax.set_xlabel('Time to Collision (s)', fontsize=LABEL_FONTSIZE)
+        ax.set_ylabel('Density', fontsize=LABEL_FONTSIZE)
         ax.set_xlim(0, 15)
-        ax.legend()
+        ax.tick_params(axis='both', labelsize=TICK_FONTSIZE)
+        ax.legend(fontsize=LEGEND_FONTSIZE, loc='upper right', frameon=True)
 
         # (d) Time Headway
         ax = axes[1, 1]
         sns.kdeplot(real_data_all['thw'], color=color_real, label='Real Data (All)', fill=True, ax=ax, alpha=0.2)
-        sns.kdeplot(real_data_top20['thw'], color=color_top20, label='Real Data (Top 20%)', fill=True, ax=ax, alpha=0.2)
+        # sns.kdeplot(
+        #     real_data_top20['thw'],
+        #     color=color_top20,
+        #     label='Real Data (Top 20%)',
+        #     fill=True,
+        #     ax=ax,
+        #     alpha=0.2,
+        # )
         sns.kdeplot(model_data['thw'], color=color_model, label='GC-AIRL', fill=True, ax=ax, alpha=0.2)
-        ax.set_title('(d) Time Headway Distribution (s)')
-        ax.set_xlabel('Time Headway (s)')
+        ax.set_title('(d) Time Headway Distribution (s)', fontsize=TITLE_FONTSIZE, pad=14)
+        ax.set_xlabel('Time Headway (s)', fontsize=LABEL_FONTSIZE)
+        ax.set_ylabel('Density', fontsize=LABEL_FONTSIZE)
         ax.set_xlim(0, 5)
-        ax.legend()
+        ax.tick_params(axis='both', labelsize=TICK_FONTSIZE)
+        ax.legend(fontsize=LEGEND_FONTSIZE, loc='upper right', frameon=True)
 
-        plt.tight_layout()
+        plt.tight_layout(pad=3.6, w_pad=2.8, h_pad=3.0)
         save_path = os.path.join(curr_dir, 'Figure5_Distribution_Comparison.png')
-        plt.savefig(save_path, dpi=300)
-        print(f"✅ Figure 5 已保存至: {save_path}")
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"[OK] Figure 5 已保存至: {save_path}")
         plt.show()
 
     def save_data(self, real_data_all, real_data_top20, model_data):
-        print("💾 正在保存分布数据...")
+        print("[*] 正在保存分布数据...")
         rows = []
         sources = {'Real_All': real_data_all, 'Real_Top20': real_data_top20, 'GC_AIRL': model_data}
         
@@ -361,7 +408,7 @@ class Figure5Generator:
         df = pd.DataFrame(rows)
         save_path = os.path.join(curr_dir, 'distribution_comparison_data.csv')
         df.to_csv(save_path, index=False)
-        print(f"✅ 分布对比数据已保存至: {save_path}")
+        print(f"[OK] 分布对比数据已保存至: {save_path}")
 
 
 if __name__ == "__main__":

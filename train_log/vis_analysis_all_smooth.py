@@ -10,7 +10,7 @@ plt.rcParams["axes.unicode_minus"] = False
 SMOOTH_WINDOW = 9
 SHADE_ALPHA = 0.18
 REWARD_SHIFT_C = 2.6
-REWARD_DISPLAY_MODE = "zero_flip"  # "shift" or "zero_flip"
+REWARD_DISPLAY_MODE = "raw"  # "raw", "shift", or "zero_flip"
 
 
 def get_column(df, possible_names):
@@ -66,6 +66,9 @@ def zero_flipped_episode_reward(reward):
 
 def display_episode_reward(df, reward):
     """Choose the visualization-only reward transform for Figure 1."""
+    if REWARD_DISPLAY_MODE == "raw":
+        print("[*] Reward display mode: raw wrapped episode reward")
+        return reward
     if REWARD_DISPLAY_MODE == "shift":
         return shifted_episode_reward(df, reward, shift_c=REWARD_SHIFT_C)
     if REWARD_DISPLAY_MODE == "zero_flip":
@@ -132,16 +135,20 @@ def plot_combined_figures(csv_path, save_dir, smooth_window=SMOOTH_WINDOW):
     if reward is not None:
         reward = display_episode_reward(df, reward)
         plot_smoothed(axes[0, 0], iterations, reward, color="#1f77b4")
-        reward_title = (
-            f"Figure 1: Shifted Episode Reward (c={REWARD_SHIFT_C})"
-            if REWARD_DISPLAY_MODE == "shift"
-            else "Figure 1: Zero-Flipped Episode Reward"
-        )
+        if REWARD_DISPLAY_MODE == "shift":
+            reward_title = f"Figure 1: Shifted Episode Reward (c={REWARD_SHIFT_C})"
+            reward_ylabel = "Displayed Reward"
+        elif REWARD_DISPLAY_MODE == "zero_flip":
+            reward_title = "Figure 1: Zero-Flipped Episode Reward"
+            reward_ylabel = "Displayed Reward"
+        else:
+            reward_title = "Figure 1: Episode Reward"
+            reward_ylabel = "Reward"
         decorate_axis(
             axes[0, 0],
             reward_title,
             "Iterations",
-            "Displayed Reward",
+            reward_ylabel,
         )
     else:
         axes[0, 0].axis("off")
@@ -240,7 +247,12 @@ def plot_combined_figures(csv_path, save_dir, smooth_window=SMOOTH_WINDOW):
     )
     plt.tight_layout(pad=3.0, rect=(0, 0, 1, 0.97))
 
-    suffix = "Shifted_c2p6" if REWARD_DISPLAY_MODE == "shift" else "ZeroFlipped"
+    if REWARD_DISPLAY_MODE == "shift":
+        suffix = "Shifted_c2p6"
+    elif REWARD_DISPLAY_MODE == "zero_flip":
+        suffix = "ZeroFlipped"
+    else:
+        suffix = "Raw"
     save_path = os.path.join(save_dir, f"Full_Training_Analysis_9Figs_Smoothed_{suffix}.png")
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
     print(f"Saved smoothed 9-figure analysis dashboard to: {save_path}")
@@ -249,5 +261,9 @@ def plot_combined_figures(csv_path, save_dir, smooth_window=SMOOTH_WINDOW):
 
 if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    csv_absolute_path = os.path.join(script_dir, "baseline_attn_goal_safe_branch_aux_probe_P300_S06_LateD4_s44_20260421_131302", "progress.csv")
+    csv_absolute_path = os.path.join(
+        script_dir,
+        "baseline_attn_goal_safe_branch_aux_probe_P30_CPairD250_NoLateLR_Save1_Eval50_seed44_20260509_113618",
+        "progress.csv",
+    )
     plot_combined_figures(csv_absolute_path, script_dir)

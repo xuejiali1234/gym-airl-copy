@@ -37,6 +37,8 @@ class Config:
     X_MAX = 72
     GOAL_TOLERANCE = 10.0
     SPEED_LIMIT = 80.0
+    PPO_RL_GOAL_PROGRESS_SCALE = 20.0
+    PPO_RL_THW_SAFE_SECONDS = 2.0
 
     # --- Reproducibility ---
     DEVICE = "cuda"

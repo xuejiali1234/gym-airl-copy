@@ -1,0 +1,559 @@
+可以。我的建议是：**现在不要再把“调参探针”当主任务，而是把 P30 固定成主模型，然后做一套结构保持的安全模块消融。**
+核心原则是：**不要直接 `ENABLE_SAFETY_MODULE=False` 当作安全模块消融**，因为那会同时换 reward net 家族、换 trainer、跳过安全预训练，不是单变量。
+
+## 1. 先给结论
+
+当前主模型仍然建议用：
+
+```text
+P30 @298：safety-first 主结果
+P30 @292：balance / hard15 辅助结果
+```
+
+P30 的底座是：
+
+```text
+old safety scalar
++ predictive residual scale = 0.5
++ CPair additive = 0.03 from epoch 1
++ legacy aux = 0
++ U220
++ D230 -> 4
++ Decay250
++ best_select_start_epoch = 270
+```
+
+这个配置在你上传的 P30 run_config 中已经明确记录；fixed protocol 复评里，P30@298 是 full217 safety-first，P30@292 是 hard15 相对更稳的候选。 
+
+所以后面的消融不要再以“找新最优”为目标，而是回答这几个论文问题：
+
+```text
+1. predictive residual 是否有贡献？
+2. CPair additive 是否有贡献？
+3. old safety scalar 是否有贡献？
+4. safety branch / safety aux / vanilla AIRL 的差异到底是什么？
+5. 这些贡献是否来自结构本身，而不是换 trainer / 换 reward net 导致？
+```
+
+---
+
+## 2. 当前仓库里需要先修的两个问题
+
+### 问题 A：`.gitattributes` 现在像是一行写完了
+
+GitHub raw 里 `.gitattributes` 当前显示为一整行：
+
+```text
+* text=auto *.py text eol=lf *.md text eol=lf ...
+```
+
+这不是推荐写法。它应该是多行，否则属性解析容易不符合预期，也可能导致 raw 视图、Codex 读文件、diff 工具表现异常。([GitHub][1])
+
+让 Codex 先改成：
+
+```gitattributes
+* text=auto
+
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.csv text eol=lf
+```
+
+然后本地执行：
+
+```bash
+git add --renormalize .
+python -m py_compile train_airl_baseline.py run_probe_sweep.py model/safety_airl.py configs/config.py
+git diff --check
+```
+
+### 问题 B：当前 GitHub 上 CPair additive 可能被置零
+
+我在当前 `train_airl_baseline.py` 里看到一处非常可疑的代码：在 `enable_predictive_safety_residual and predictive_safety_enable_cpair_additive` 分支下，`safety_cpair_additive_weight` 看起来被设成了 `0.0`，而不是 `predictive_safety_cpair_additive_coeff`。后面实例化 `MildSafetyAIRL` 时又把这个 weight 传进去。([GitHub][2])
+
+这和 P30 的历史配置冲突：P30 应该是 `CPair additive = 0.03 from epoch 1`。P30 历史 run_config 里确实是 CPair additive 开启且系数 0.03。
+
+让 Codex 重点检查这段。应该改成类似：
+
+```python
+safety_cpair_additive_weight = 0.0
+if (
+    enable_predictive_safety_residual
+    and predictive_safety_enable_cpair_additive
+    and predictive_safety_cpair_additive_start_epoch <= 1
+):
+    safety_cpair_additive_weight = predictive_safety_cpair_additive_coeff
+```
+
+如果需要支持 start epoch，不要在初始化阶段写死，建议加一个 helper：
+
+```python
+def active_cpair_weight(epoch: int) -> float:
+    if not predictive_safety_enable_cpair_additive:
+        return 0.0
+    if epoch < predictive_safety_cpair_additive_start_epoch:
+        return 0.0
+    return predictive_safety_cpair_additive_coeff
+```
+
+并在每个 chunk 开始前更新：
+
+```python
+airl_trainer.safety_cpair_additive_weight = active_cpair_weight(chunk_start_epoch)
+```
+
+现在 `MildSafetyAIRL` 已经有 `safety_cpair_additive_weight`、candidate set、safe selection、rank metric 等参数；`safety_airl.py` 里也已经实现了 candidate set 和 CPair loss 的路径。([GitHub][3])
+
+---
+
+## 3. 不要直接用 `ENABLE_SAFETY_MODULE=False` 做核心消融
+
+当前代码里：
+
+```python
+enable_safety = cfg.ENABLE_SAFETY_MODULE
+enable_safety_branch = enable_safety and cfg.ENABLE_SAFETY_BRANCH
+enable_safety_aux = enable_safety and cfg.ENABLE_SAFETY_AUX_LOSS
+```
+
+也就是说，一旦 `ENABLE_SAFETY_MODULE=False`，就不是只关一个安全信号，而是整个安全路径都变了。([GitHub][2])
+
+更关键的是，当前 reward net 构造逻辑是：
+
+```text
+enable_safety=True:
+  SafeQAttentionRewardNet / SafeQMLPRewardNet
+
+enable_safety=False:
+  AttentionRewardNet / BasicRewardNet
+```
+
+这已经不是同结构消融，而是换 reward net 家族。代码里也已经支持 `ZeroSafetyQNetwork`，这正好应该被用来做结构保持消融。([GitHub][2])
+
+所以核心消融应该分成两类：
+
+```text
+A. structure-preserving ablation：
+   保持 SafeQRewardNet + MildSafetyAIRL，只把某个安全信号置零。
+
+B. full no-safety baseline：
+   ENABLE_SAFETY_MODULE=False，只作为完整去安全 baseline，不作为单因子消融。
+```
+
+官方 imitation 文档也提醒，AIRL 训练里 learned reward 会替代环境 reward；`debug_use_ground_truth=True` 才会关闭这种 reward wrapping，用于 sanity check policy training 是否正常。([Imitation][4])
+
+---
+
+## 4. 推荐的安全消融矩阵
+
+先跑最小 5 组，不要一下子大规模 sweep。
+
+### A0：P30 full control
+
+```text
+A0_P30_Full
+
+ENABLE_SAFETY_MODULE = 1
+ENABLE_SAFETY_BRANCH = 1
+ENABLE_SAFETY_AUX_LOSS = 1
+
+ENABLE_PREDICTIVE_SAFETY_RESIDUAL = 1
+PREDICTIVE_SAFETY_RESIDUAL_SCALE = 0.5
+
+PREDICTIVE_SAFETY_ENABLE_CPAIR_ADDITIVE = 1
+PREDICTIVE_SAFETY_CPAIR_ADDITIVE_START_EPOCH = 1
+PREDICTIVE_SAFETY_CPAIR_ADDITIVE_COEFF = 0.03
+
+PREDICTIVE_SAFETY_BASE_REG_COEFF = 0.0
+PREDICTIVE_SAFETY_LATE_REG_COEFF = 0.0
+
+candidate_set = current
+safe_selection = min_risk
+rank_metric = clipped
+
+U220 + D230 + Decay250
+```
+
+这就是 P30 rerun。当前 `run_probe_sweep.py` 里已经有 `P30_CPairD250_NoLateLR_Save1_Rerun`，但要先修上面 CPair weight 可疑问题。([GitHub][5])
+
+### A1：去掉 predictive residual，只保留 CPair
+
+目的：回答 predictive residual scalar 是否有贡献。
+
+```text
+A1_NoResidual_KeepCPair
+
+保持 predictive net 仍然实例化：
+  ENABLE_PREDICTIVE_SAFETY_RESIDUAL = 1
+  PREDICTIVE_SAFETY_RESIDUAL_SCALE = 0.0
+
+保持：
+  CPair additive = 0.03 from epoch 1
+  old safety scalar 真实
+  legacy aux = 0
+```
+
+注意不要用 `ENABLE_PREDICTIVE_SAFETY_RESIDUAL=0`，否则 predictive net 可能不被实例化，CPair 也拿不到 `get_safety_debug`。安全做法是：**residual 开启但 scale=0.0**。
+
+### A2：去掉 CPair，只保留 predictive residual
+
+目的：回答 CPair 是否有贡献。这个你之前 P27 线已经基本证明过，但代码更新后建议用同一版本重跑一次。
+
+```text
+A2_NoCPair_KeepResidual
+
+ENABLE_PREDICTIVE_SAFETY_RESIDUAL = 1
+PREDICTIVE_SAFETY_RESIDUAL_SCALE = 0.5
+
+PREDICTIVE_SAFETY_ENABLE_CPAIR_ADDITIVE = 0
+PREDICTIVE_SAFETY_CPAIR_ADDITIVE_COEFF = 0.0
+
+legacy aux = 0
+old safety scalar 真实
+```
+
+历史上 `P27_CPairZero_D250` 说明“residual0.5 + no legacy + no CPair + Decay250”撑不起来。
+
+### A3：去掉 predictive residual 和 CPair，只保留 old safety scalar 结构
+
+目的：回答 P30 的 predictive 组件总体贡献。
+
+```text
+A3_NoPredictiveSignal
+
+ENABLE_PREDICTIVE_SAFETY_RESIDUAL = 1
+PREDICTIVE_SAFETY_RESIDUAL_SCALE = 0.0
+
+PREDICTIVE_SAFETY_ENABLE_CPAIR_ADDITIVE = 0
+PREDICTIVE_SAFETY_CPAIR_ADDITIVE_COEFF = 0.0
+
+old safety scalar = real
+legacy aux = 0
+SafeQRewardNet + MildSafetyAIRL 保留
+```
+
+这组是非常干净的“P30 去 predictive”消融。
+
+### A4：Zero old safety scalar，只保留 predictive residual + CPair
+
+目的：回答 old safety scalar 是否仍然必要。
+
+```text
+A4_ZeroOldSafety_KeepPredictive
+
+ENABLE_SAFETY_MODULE = 1
+ENABLE_SAFETY_BRANCH = 0     # 用 ZeroSafetyQNetwork
+ENABLE_SAFETY_AUX_LOSS = 1
+
+ENABLE_PREDICTIVE_SAFETY_RESIDUAL = 1
+PREDICTIVE_SAFETY_RESIDUAL_SCALE = 0.5
+
+PREDICTIVE_SAFETY_ENABLE_CPAIR_ADDITIVE = 1
+PREDICTIVE_SAFETY_CPAIR_ADDITIVE_COEFF = 0.03
+PREDICTIVE_SAFETY_CPAIR_ADDITIVE_START_EPOCH = 1
+
+legacy aux = 0
+```
+
+这组非常重要。它保持 `SafeQAttentionRewardNet + MildSafetyAIRL`，只是把 old safety branch 换成恒零，避免换成 vanilla reward net。当前代码已经有 `ZeroSafetyQNetwork` 路径。([GitHub][2])
+
+### A5：结构保持但去掉所有安全 regulator
+
+目的：回答“只是安全 scalar 输入”是否足够。
+
+```text
+A5_InputOnly_NoReg
+
+old safety scalar = real
+predictive residual = 0.5
+
+CPair additive = 0
+legacy aux = 0
+gen penalty = 0
+
+SafeQRewardNet + MildSafetyAIRL 保留
+```
+
+如果 A5 比 A3 好，说明 predictive scalar 输入本身有用；如果 A5 接近 A3，而 A0 明显更好，说明收益主要来自 CPair。
+
+---
+
+## 5. 只作为 baseline 的组，不要当单因子消融
+
+### B0：Vanilla AIRL no-safety baseline
+
+```text
+B0_VanillaAIRL_NoSafety
+
+ENABLE_SAFETY_MODULE = 0
+ENABLE_ATTENTION = 1
+ENABLE_GOAL_CONDITION = 1
+```
+
+这组会换成 `AttentionRewardNet` 和原生 `AIRL`，不是单因子消融。代码里 `enable_safety=False` 时确实会走非 SafeQ reward net，并最终实例化 vanilla `AIRL`。([GitHub][2])
+
+论文里应该写成：
+
+```text
+Full no-safety baseline
+```
+
+不要写成：
+
+```text
+- safety module
+```
+
+### B1：Ground-truth reward sanity check
+
+```text
+B1_GTReward_Sanity
+
+DEBUG_USE_GROUND_TRUTH_REWARD = 1
+```
+
+这组不是论文主消融，只用于检查 PPO / 环境 / 数据是否正常。imitation 文档说明这个开关会禁用 learned reward wrapping，用环境 reward 做 sanity check。([Imitation][4])
+
+---
+
+## 6. Codex 具体修改任务清单
+
+可以直接把下面这段交给 Codex。
+
+### Task 1：修 `.gitattributes`
+
+```text
+把当前一行式 .gitattributes 改为多行；
+执行 git add --renormalize .；
+确认 python -m py_compile 通过；
+确认 git diff --check 通过。
+```
+
+### Task 2：修 CPair additive weight 初始化和 schedule
+
+检查 `train_airl_baseline.py` 里创建 `MildSafetyAIRL` 前的：
+
+```python
+if enable_predictive_safety_residual and predictive_safety_enable_cpair_additive:
+    safety_cpair_additive_weight = 0.0
+```
+
+如果本地确实如此，改为：
+
+```python
+def compute_cpair_weight(epoch: int) -> float:
+    if not predictive_safety_enable_cpair_additive:
+        return 0.0
+    if epoch < predictive_safety_cpair_additive_start_epoch:
+        return 0.0
+    return predictive_safety_cpair_additive_coeff
+```
+
+初始化：
+
+```python
+safety_cpair_additive_weight = compute_cpair_weight(0)
+```
+
+每个 chunk 开始前：
+
+```python
+airl_trainer.safety_cpair_additive_weight = compute_cpair_weight(chunk_start_epoch)
+```
+
+并在 `progress.csv` 或 logger 中记录：
+
+```text
+effective_cpair_weight
+effective_predictive_residual_scale
+effective_legacy_weight
+effective_safety_branch_type: real / zero / none
+effective_trainer_class: MildSafetyAIRL / AIRL
+effective_reward_net_class
+```
+
+### Task 3：新增结构保持 ablation experiments
+
+把当前 `run_probe_sweep.py` 里的 P45 删除，不再跑 schedule smoothing。当前文件里还保留了 `P45_P30_SmoothTransitions` 和 `P30_CPairD250_NoLateLR_Save1_Rerun`。([GitHub][5])
+
+替换成：
+
+```python
+EXPERIMENTS = [
+    A0_P30_Full,
+    A1_NoResidual_KeepCPair,
+    A2_NoCPair_KeepResidual,
+    A3_NoPredictiveSignal,
+    A4_ZeroOldSafety_KeepPredictive,
+    A5_InputOnly_NoReg,
+    B0_VanillaAIRL_NoSafety,
+]
+```
+
+其中 A0~A5 都必须保持：
+
+```text
+PROBE_SEED = 44
+PROBE_PPO_EPOCHS = 6
+PROBE_PPO_MINI_BATCH_SIZE = 256
+PROBE_GENERATOR_LR = 8e-5
+PROBE_DISCRIMINATOR_LR = 5e-5
+PROBE_N_DISC_UPDATES = 5
+PROBE_LATE_N_DISC_EPOCH = 230
+PROBE_LATE_N_DISC_UPDATES = 4
+PROBE_SAFETY_DECAY_EPOCH = 250
+PROBE_SAFETY_DECAY_LR = 2.5e-6
+PROBE_SAVE_FREQ_EPOCHS = 1
+PROBE_BEST_SELECT_START_EPOCH = 270
+PROBE_FULL_EVAL_EPISODES = 100
+PROBE_REWARD_NORM = 0
+PROBE_SAFETY_FUSE_FEATURE = 0
+PROBE_SAFETY_EMBED_DIM = 1
+```
+
+P30 的历史主线一直是 scalar-only，不要让 config 默认的 `SAFETY_FUSE_FEATURE=True` 污染这套消融；当前 config 里确实还写着 `SAFETY_FUSE_FEATURE=True`，但 P30 需要通过 override 强制关掉。([GitHub][6])
+
+### Task 4：保存 AIRL reward/discriminator checkpoint
+
+之前 D31 诊断里 reward gap 只能记成 `NA`，原因是 PPO policy zip 不包含 AIRL discriminator / reward-net 权重。
+
+让 Codex 增加：
+
+```python
+torch.save(
+    {
+        "reward_net": reward_net.state_dict(),
+        "base_reward_net": base_reward_net.state_dict(),
+        "safety_net": safety_net.state_dict() if safety_net is not None else None,
+        "predictive_safety_net": predictive_safety_net.state_dict() if predictive_safety_net is not None else None,
+        "config": config_to_dict(cfg),
+        "effective_params": effective_params,
+    },
+    os.path.join(checkpoint_dir, f"airl_reward_epoch_{epoch}.pt"),
+)
+```
+
+保存频率可以和 policy checkpoint 一致，至少保存：
+
+```text
+292 / 298 / best_epoch / final
+```
+
+这样以后能做真正的：
+
+```text
+reward_gap(policy_action vs safe_candidate)
+risk_gap
+reward ranking 是否排反
+```
+
+---
+
+## 7. 推荐实验顺序
+
+不要一次全跑。先做两步 sanity：
+
+```text
+Step 0:
+  python run_probe_sweep.py --dry-run
+  确认 A0 的 effective_cpair_weight = 0.03
+
+Step 1:
+  跑 A0_P30_Full_Rerun
+  目标：重新出现 292~298 甜点。
+```
+
+如果 A0 不能复现 P30 的训练内窗口：
+
+```text
+@292~298 附近：
+merge >= 0.88
+endpoint >= 0.96
+safety >= 0.92
+collision <= 0.04
+```
+
+那说明当前仓库和历史 P30 已经不一致，先不要跑消融，回查 CPair weight / line ending / config override。
+
+A0 复现后，再跑：
+
+```text
+A1_NoResidual_KeepCPair
+A2_NoCPair_KeepResidual
+A4_ZeroOldSafety_KeepPredictive
+A5_InputOnly_NoReg
+```
+
+最后再跑：
+
+```text
+B0_VanillaAIRL_NoSafety
+```
+
+---
+
+## 8. 评价与论文表述
+
+所有消融都用同一个 fixed protocol：
+
+```text
+full217
+hard15
+```
+
+当前 protocol gate 是：
+
+```text
+Full endpoint >= 0.95
+Full safety >= 0.90
+Full collision <= 0.01
+Hard15 collision_count == 0
+```
+
+之前所有模型都没有通过这个 gate，所以论文里不要写“通过安全 gate”，而应该写相对改善。
+
+建议主表这样写：
+
+```text
+P30 @298:
+  safety-first main
+
+P30 @292:
+  hard15 / balance auxiliary
+
+A1/A2/A3/A4/A5:
+  structure-preserving ablations
+
+B0:
+  full no-safety baseline
+```
+
+不要把 B0 和 A 系列混在一起解释。
+
+---
+
+## 9. 当前最终建议
+
+现在最安全的路线是：
+
+```text
+1. 修 .gitattributes；
+2. 修 / 验证 CPair additive weight 没被置零；
+3. 删除 P45 继续训练线；
+4. 用 P30 rerun 做 sanity；
+5. 跑结构保持消融 A1~A5；
+6. 最后才跑 vanilla AIRL baseline。
+```
+
+一句话：**不要用 `ENABLE_SAFETY_MODULE=False` 直接做安全模块消融；P30 的消融必须保持 SafeQRewardNet + MildSafetyAIRL 结构不变，只逐项置零 old safety scalar、predictive residual、CPair 和 regulator。这样结果才可以写进论文。**
+
+[1]: https://raw.githubusercontent.com/xuejiali1234/gym-airl-copy/main/.gitattributes "raw.githubusercontent.com"
+[2]: https://github.com/xuejiali1234/gym-airl-copy/blob/main/train_airl_baseline.py "gym-airl-copy/train_airl_baseline.py at main · xuejiali1234/gym-airl-copy · GitHub"
+[3]: https://github.com/xuejiali1234/gym-airl-copy/blob/main/model/safety_airl.py "gym-airl-copy/model/safety_airl.py at main · xuejiali1234/gym-airl-copy · GitHub"
+[4]: https://imitation.readthedocs.io/en/stable/algorithms/airl.html?utm_source=chatgpt.com "Adversarial Inverse Reinforcement Learning (AIRL) - imitation"
+[5]: https://raw.githubusercontent.com/xuejiali1234/gym-airl-copy/main/run_probe_sweep.py "raw.githubusercontent.com"
+[6]: https://github.com/xuejiali1234/gym-airl-copy/blob/main/configs/config.py "gym-airl-copy/configs/config.py at main · xuejiali1234/gym-airl-copy · GitHub"
